@@ -4,13 +4,6 @@
 <b>专为极其嘈杂的 Live 现场、音乐节以及电台访谈深度定制的工业级 AI 字幕流水线</b>
 </p>
 
-<p align="center">
-<img src="https://www.google.com/search?q=https://img.shields.io/badge/Python-3.10%252B-blue.svg" alt="Python Version">
-<img src="https://www.google.com/search?q=https://img.shields.io/badge/Audio-Demucs_v4-green.svg" alt="Demucs">
-<img src="https://www.google.com/search?q=https://img.shields.io/badge/ASR-Faster--Whisper-orange.svg" alt="Faster-Whisper">
-<img src="https://www.google.com/search?q=https://img.shields.io/badge/LLM-DeepSeek%2520%257C%2520Gemini-purple.svg" alt="LLM">
-<img src="https://www.google.com/search?q=https://img.shields.io/badge/UI-CustomTkinter-black.svg" alt="CustomTkinter">
-</p>
 
 📖 项目简介
 
