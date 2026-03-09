@@ -1,0 +1,32 @@
+# 忽略所有媒体文件
+*.mp4
+*.mkv
+*.wav
+*.mp3
+*.flac
+
+# 忽略临时字幕和缓存
+*.srt
+*.json
+!config.json # 如果你有配置文件，根据需要保留
+
+# 忽略 Python 缓存
+__pycache__/
+*.pyc
+
+# 忽略系统文件
+.DS_Store
+
+# 忽略输出文件夹和输入文件夹里的巨大文件
+output/
+input/video/
+input/audio/
+
+# ⚠️ 忽略环境变量（保护 API Key）
+.env
+
+#⚠️ 忽略大模型权重文件（极其重要，否则 Git 会卡死）
+
+models_faster/
+models/
+check_models.py

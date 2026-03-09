@@ -1,0 +1,5 @@
+openai-whisper
+demucs
+ffmpeg-python
+# 3. **安装依赖**：打开你的终端（CMD / PowerShell / macOS Terminal），使用 `cd` 命令进入到你刚才创建的 `utasync` 文件夹下。然后输入以下命令来一键安装我们需要的库（复习一下你学过的 pip 操作）：
+# `pip install -r requirements.txt`
