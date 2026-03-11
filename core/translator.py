@@ -8,11 +8,30 @@ from openai import OpenAI
 
 class SubtitleTranslator:
     """
-    大模型字幕翻译与纠错引擎 (强力纠错版 + 物理锁死时间轴 + 妥协放行防崩机制)
+    大模型字幕翻译与纠错引擎 (强力纠错版 + 物理锁死时间轴 + 妥协放行 + 防漏翻回滚版)
     """
     
-    def __init__(self, api_key, base_url, primary_model, reasoning_model=None, srt_path="", reference_txt_path=None, output_mode="bilingual"):
-        self.client = OpenAI(api_key=api_key, base_url=base_url)
+    def __init__(self, api_key, base_url, primary_model, reasoning_model=None, srt_path="", reference_txt_path=None, output_mode="bilingual", proxy_url=""):
+        client_kwargs = {
+            "api_key": api_key,
+            "base_url": base_url,
+        }
+        
+        if proxy_url:
+            try:
+                import httpx
+                if not proxy_url.startswith("http://") and not proxy_url.startswith("socks5://"):
+                    proxy_url = "http://" + proxy_url
+                client_kwargs["http_client"] = httpx.Client(proxies=proxy_url)
+                print(f"   -> 🌐 [网络管家] 检测到自定义代理，已成功挂载: {proxy_url}")
+            except ImportError:
+                print(f"   -> ⚠️ [网络管家] 未安装 httpx 库，无法挂载代理。如需走代理请在终端执行 pip install httpx")
+            except Exception as e:
+                print(f"   -> ⚠️ [网络管家] 代理格式错误，已自动切回直连: {e}")
+        else:
+            print(f"   -> ⚡ [网络管家] 未配置代理，大模型请求将使用物理直连。")
+            
+        self.client = OpenAI(**client_kwargs)
         self.primary_model = primary_model
         self.reasoning_model = reasoning_model if reasoning_model else primary_model 
         
@@ -28,6 +47,7 @@ class SubtitleTranslator:
         self.cache_file = os.path.join(os.path.dirname(self.output_srt_path), f"{os.path.basename(base_name)}_翻译缓存.json")
         self.cache_lock = threading.Lock()
         self.translation_cache = self._load_cache()
+        self.cancel_event = None 
 
     def _load_cache(self):
         if os.path.exists(self.cache_file):
@@ -47,8 +67,8 @@ class SubtitleTranslator:
             try:
                 with open(self.cache_file, 'w', encoding='utf-8') as f:
                     json.dump(self.translation_cache, f, ensure_ascii=False, indent=2)
-            except Exception as e:
-                print(f"   -> ⚠️ 缓存保存失败: {e}")
+            except Exception:
+                pass
 
     def read_reference_lyrics(self):
         if self.reference_txt_path and os.path.exists(self.reference_txt_path):
@@ -56,11 +76,11 @@ class SubtitleTranslator:
                 with open(self.reference_txt_path, 'r', encoding='utf-8') as f:
                     content = f.read().strip()
                     lyric_name = os.path.basename(self.reference_txt_path)
-                    print(f"   -> 📚 成功加载参考歌词: [{lyric_name}] (系统将分配极速主模型)")
+                    print(f"   -> 📚 成功加载参考歌词: [{lyric_name}]")
                     return content
             except Exception:
                 pass
-        print("   -> 🔎 未检测到参考歌词！(系统将自动分配重型推理模型进行盲翻)")
+        print("   -> 🔎 未检测到参考歌词！(系统将自动进行盲翻)")
         return ""
 
     def parse_srt(self):
@@ -70,7 +90,7 @@ class SubtitleTranslator:
         return [b.strip() for b in blocks if b.strip()]
 
     def _restore_timestamps(self, translated_content, original_blocks):
-        """🌟 核心防护：物理锁死时间轴，防止大模型篡改或幻觉导致重叠"""
+        """🌟 核心防护：物理锁死时间轴 (已撤销硬杀伤，防止错杀漏翻)"""
         time_map = {}
         for block in original_blocks:
             lines = [line.strip() for line in block.split('\n') if line.strip()]
@@ -87,14 +107,15 @@ class SubtitleTranslator:
             if not lines:
                 continue
                 
-            idx_str = re.sub(r'[^\d]', '', lines[0])
-            
             time_idx = -1
             for i, line in enumerate(lines):
                 if '-->' in line:
                     time_idx = i
                     break
             
+            # 🌟 回滚点1：如果大模型连时间轴都没写，说明有异常文本。
+            # 我们不删除它，而是直接保留原样进入后续环节，宁可粘在上一句，也绝不删丢字。
+            idx_str = re.sub(r'[^\d]', '', lines[0])
             if time_idx != -1 and idx_str in time_map:
                 lines[time_idx] = time_map[idx_str]
                 
@@ -112,7 +133,7 @@ class SubtitleTranslator:
                 continue
                 
             has_time = any('-->' in line for line in lines)
-            
+            # 🌟 回滚点2：恢复原版的兜底拼接逻辑
             if has_time:
                 valid_blocks.append(lines)
             else:
@@ -139,11 +160,9 @@ class SubtitleTranslator:
                 continue
                 
             if self.output_mode == "bilingual":
-                # 斩杀纯假名噪音
                 if len(text_lines) == 1 and re.search(r'[\u3040-\u309F\u30A0-\u30FF]', text_lines[0]):
                     continue
             elif self.output_mode == "chinese_only":
-                # 🌟 斩杀违规混入的日文双语
                 if len(text_lines) > 1:
                     filtered_lines = [l for l in text_lines if not re.search(r'[\u3040-\u309F\u30A0-\u30FF]', l)]
                     if filtered_lines:
@@ -156,6 +175,9 @@ class SubtitleTranslator:
         return '\n\n'.join(reindexed_blocks)
 
     def translate_single_batch(self, batch_text, prev_context, batch_idx, total_batches, reference_lyrics, target_model, is_sub_batch=False):
+        if self.cancel_event and self.cancel_event.is_set():
+            raise Exception("用户中断：翻译线程已终止")
+            
         if not is_sub_batch and str(batch_idx) in self.translation_cache:
             return batch_idx, self.translation_cache[str(batch_idx)]
             
@@ -168,6 +190,8 @@ class SubtitleTranslator:
         
         max_retries = 5
         for attempt in range(max_retries):
+            if self.cancel_event and self.cancel_event.is_set():
+                raise Exception("用户中断：翻译线程已终止")
             try:
                 response = self.client.chat.completions.create(
                     model=target_model,
@@ -188,12 +212,17 @@ class SubtitleTranslator:
                 
                 lines = result_text.split('\n')
                 
-                # 🌟 终极妥协机制：前4次严格要求，第5次(最后一次)直接豁免放行，保全大局！
                 if len(lines) > 0 and attempt < max_retries - 1:
                     last_line = lines[-1].strip()
                     if re.match(r'^\d+$', last_line) or '-->' in last_line or result_text.endswith("-->") or (last_line.isdigit() and len(last_line) <= 3):
                         raise Exception("API 输出了没写完的半截子字幕，判定为网络异常，准备重试")
                 
+                input_time_count = batch_text.count('-->')
+                output_time_count = result_text.count('-->')
+                if attempt < max_retries - 1:
+                    if output_time_count < input_time_count * 0.6:
+                        raise Exception(f"严重漏翻！输入 {input_time_count} 句，仅输出 {output_time_count} 句，模型截断偷懒，强制重试")
+
                 if not is_sub_batch:
                     self._save_to_cache(batch_idx, result_text)
                 
@@ -206,11 +235,12 @@ class SubtitleTranslator:
                 
             except Exception as e:
                 error_msg = str(e)
+                if "用户中断" in error_msg:
+                    raise e
                 if "401" in error_msg or "403" in error_msg:
                     print(f"\n❌ [致命错误] 批次 {batch_idx + 1} API 认证失败: 请检查您的 API Key 是否正确。")
                     raise e
                 
-                # 🌟 动态切分降级机制：如果失败了 2 次，动刀切分！
                 if attempt == 2 and not is_sub_batch:
                     blocks = batch_text.split('\n\n')
                     if len(blocks) > 1:
@@ -235,10 +265,11 @@ class SubtitleTranslator:
                     print(f"      ⚠️ 批次 {batch_idx + 1} 发生错误 ({error_msg})，正在尝试重试 ({attempt+1}/{max_retries})...")
                     time.sleep(5)
         else:
-            raise Exception(f"❌ 批次 {batch_idx + 1} 重试次数过多，任务异常终止。")
+            print(f"   -> 🚨 [终极妥协] 批次 {batch_idx + 1} 经历 {max_retries} 次重试依旧失败，已强制放行原文以保证全局进度！")
+            return batch_idx, batch_text
 
     def translate_blocks(self, blocks, reference_lyrics=""):
-        batch_size = 30
+        batch_size = 15 
         batches = []
         contexts = [] 
         
@@ -265,6 +296,10 @@ class SubtitleTranslator:
             }
             
             for future in concurrent.futures.as_completed(future_to_batch):
+                if self.cancel_event and self.cancel_event.is_set():
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    raise Exception("用户中断：已清空翻译任务队列")
+                    
                 try:
                     batch_idx, translated_text = future.result()
                     results.append((batch_idx, translated_text))
@@ -284,11 +319,6 @@ class SubtitleTranslator:
 7. 📝 【强制单行排版】：同一个时间轴内，【只允许1行日文和1行中文】！无论句子多长，都绝对不准在日文或中文内部使用换行符拆分！日文必须是完整的一行，紧接着中文是完整的一行。
 8. 🗑️ 【过滤杂音】：如果发音是纯粹的无意义杂音、和声（且不在歌词库中），请必须直接删除该时间轴，不要输出任何替代文字。
 9. 🔄 【强制替换日文原文】：输入的原轴中如果有听错的假名/片假名（拼音），【绝对不准】原样照抄！你必须根据发音，用官方歌词库中绝对正确的日文原句（汉字/平假名）将其彻底替换掉！
-输出格式示例：
-1
-00:00:00,000 --> 00:00:05,000
-笑って生きることが楽になるの
-笑着活下去会变得轻松吗
 """
         else:
             format_rules = """
@@ -296,10 +326,6 @@ class SubtitleTranslator:
 7. 📝 【强制单行排版】：同一个时间轴内，【只允许1行中文】！无论句子多长，都绝对不准使用换行符！
 8. 🗑️ 【过滤杂音】：无意义的杂音、和声请直接删除该时间轴。绝不允许输出日文原文。
 9. 🚨 【零日文容忍】：输出文本中【绝对不允许】包含任何日文平假名或片假名！必须全部翻译为中文。如果遇到人名，请音译或保留英文字母，绝对不准输出日文！
-输出格式示例：
-1
-00:00:00,000 --> 00:00:05,000
-笑着活下去会变得轻松吗
 """
 
         system_instruction = f"""
@@ -311,7 +337,8 @@ class SubtitleTranslator:
 2. 🚫 【禁止做任何总结或注释】：严禁输出如“[注：此处为和声不予呈现]”之类的文字。直接合并或删除即可。
 3. 🎤 【MC 谈话处理】：如果在歌词库找不到对应的词，说明是歌手在说话！请发挥你的听译能力，将内容翻译成中文，严禁跳过不翻。
 4. 🗑️ 【纯净输出】：不要输出任何多余的前言、后记或思考过程，直接返回纯净的 SRT 结果。
-5. 🛡️ 【严禁偷懒与截断】：你必须完整翻译输入的每一行字幕！绝对不允许中途停止、省略后半部分或罢工，务必把提供的所有文本处理完！
+5. 🛡️ 【严禁偷懒与截断】：你必须完整翻译输入的每一行字幕！绝对不允许中途停止、省略后半部分或罢工！
+10. 🔇 【绝对禁止AI对话废话】(最重要！)：严禁输出任何解释性话语（例如：“这是夸奖的词”、“好的，为您翻译”、“没有对应原文”等）。如果你想解释，请立刻闭嘴！只能输出 SRT 结构。如果你觉得没有原文，请直接发挥想象力盲翻，绝对不准向用户发任何解释说明！
 {format_rules}
 """
         if reference_lyrics:
@@ -324,7 +351,8 @@ class SubtitleTranslator:
         
         return system_instruction
 
-    def run(self):
+    def run(self, cancel_event=None):
+        self.cancel_event = cancel_event
         print(f"\n🤖 [大模型处理阶段] 启动高精度翻译与智能排版引擎...")
         reference_lyrics = self.read_reference_lyrics()
         blocks = self.parse_srt()
@@ -333,9 +361,7 @@ class SubtitleTranslator:
             start_time = time.time()
             final_srt_content = self.translate_blocks(blocks, reference_lyrics)
             
-            # 🌟 物理锁死时间轴
             final_srt_content = self._restore_timestamps(final_srt_content, blocks)
-            
             final_srt_content = self._reindex_srt(final_srt_content)
             
             with open(self.output_srt_path, 'w', encoding='utf-8') as f:
@@ -346,7 +372,8 @@ class SubtitleTranslator:
             print(f"📁 最终字幕已就绪: {self.output_srt_path}")
             
             return self.output_srt_path
-        except Exception:
-            print("\n❌ 翻译阶段失败。由于 API Key 无效或网络原因，未能生成最终字幕。")
-            print("💡 建议：请检查 API Key 后再次运行程序，断点续传机制会自动跳过已完成的部分。")
+        except Exception as e:
+            if "用户中断" not in str(e):
+                print(f"\n❌ 翻译阶段失败: {e}")
+                print("💡 建议：请检查 API Key 后再次运行程序，断点续传机制会自动跳过已完成的部分。")
             return None

@@ -1,5 +1,22 @@
-openai-whisper
+# ==========================================
+# UtaSync V2.0 核心依赖清单
+# ==========================================
+
+# 1. 提音与分离引擎 (注: 电脑仍需安装并配置 FFmpeg 环境变量)
 demucs
+
+# 2. 极速打轴引擎 (替代原版 Whisper)
+faster-whisper
+
+# 3. 大模型翻译引擎与网络代理穿透
+openai
+httpx
+
+# 4. 桌面端暗黑 GUI 界面
+customtkinter
+
+# ==========================================
+# (可选) V1.x 旧版命令行兼容依赖保留
+# ==========================================
+openai-whisper
 ffmpeg-python
-# 3. **安装依赖**：打开你的终端（CMD / PowerShell / macOS Terminal），使用 `cd` 命令进入到你刚才创建的 `utasync` 文件夹下。然后输入以下命令来一键安装我们需要的库（复习一下你学过的 pip 操作）：
-# `pip install -r requirements.txt`
