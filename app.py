@@ -5,6 +5,7 @@ import time
 import threading
 import hashlib
 import queue 
+import gc
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 
@@ -29,7 +30,7 @@ ACCENT_RED_HOVER = "#7F1D1D"
 
 TEXT_TITLE = "#FFFFFF"     
 TEXT_MUTED = "#888888"     
-TEXT_HINT = "#555555"      
+TEXT_HINT = "#666666"      
 
 ctk.set_appearance_mode("dark")
 
@@ -43,11 +44,13 @@ def load_settings():
         except:
             pass
     return {
-        "api_key": "", "api_provider": "SiliconFlow (智能路由)", 
-        "model_size": "large-v2", "audio_type": "Live 现场演唱 (常规/摇滚)", 
+        "api_key": "", "api_preset": "SiliconFlow (DeepSeek-V3)", 
+        "api_url": "https://api.siliconflow.cn/v1",
+        "api_model": "deepseek-ai/DeepSeek-V3",
+        "model_size": "large-v2 (战神级/推荐)", "audio_type": "Live 现场演唱 (常规/摇滚)", 
         "output_mode": "中日双语字幕", "use_demucs": "开启分离 (Live音乐必选)",
         "proxy_url": "",
-        "cached_lyrics": "" # 🌟 新增：用于存放用户上次粘贴的歌词
+        "cached_lyrics": "" 
     }
 
 def save_settings(settings):
@@ -92,29 +95,26 @@ class UtaSyncApp(ctk.CTk):
         sys.stderr = self.stdout_redirector
         
         self.after(100, self.process_console_queue)
-
-        # 🌟 拦截窗口关闭事件，执行优雅退出与自动保存
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
         print("💡 UtaSync 核心引擎已挂载就绪。\n等待导入媒体文件...")
 
     def save_all_ui_states(self):
-        """🌟 核心增强：一键保存当前界面上所有的设置和文本（包括万字长歌词）"""
         self.settings = {
             "api_key": self.api_key_entry.get().strip(), 
-            "api_provider": self.opt_api_provider.get(),
+            "api_preset": self.opt_api_preset.get(),
+            "api_url": self.api_url_entry.get().strip(),
+            "api_model": self.api_model_entry.get().strip(),
             "model_size": self.opt_model.get(), 
             "audio_type": self.opt_audio_type.get(), 
             "output_mode": self.opt_output_mode.get(), 
             "use_demucs": self.opt_demucs.get(),
             "proxy_url": self.proxy_entry.get().strip(),
-            "cached_lyrics": self.lyrics_textbox.get("1.0", "end-1c") # 精准提取黑板上的所有歌词
+            "cached_lyrics": self.lyrics_textbox.get("1.0", "end-1c") 
         }
         save_settings(self.settings)
 
     def on_closing(self):
-        """🌟 优雅退出：自动保存一切，并防止红叉"""
-        # 关闭软件的瞬间，自动保存歌词，下次打开原样恢复！
         try:
             self.save_all_ui_states()
         except Exception:
@@ -142,89 +142,163 @@ class UtaSyncApp(ctk.CTk):
                 
         self.after(50, self.process_console_queue)
 
+    def show_help_dialog(self):
+        help_window = ctk.CTkToplevel(self)
+        help_window.title("UtaSync 参数说明与帮助指南")
+        help_window.geometry("680x780")
+        help_window.minsize(600, 650)
+        help_window.configure(fg_color=BG_WORKSPACE)
+        help_window.attributes("-topmost", True) 
+        
+        title_lbl = ctk.CTkLabel(help_window, text="📖 UtaSync 参数配置说明", font=ctk.CTkFont(family="Microsoft YaHei", size=18, weight="bold"), text_color=TEXT_TITLE)
+        title_lbl.pack(pady=(25, 15))
+        
+        help_textbox = ctk.CTkTextbox(help_window, font=ctk.CTkFont(family="Microsoft YaHei", size=13), fg_color=BG_CARD, text_color="#CCCCCC", wrap="word", corner_radius=10)
+        help_textbox.pack(fill="both", expand=True, padx=25, pady=(0, 25))
+        
+        help_text = """
+【🎵 声学模型 (Acoustic)】
+• Live 现场演唱 (常规/摇滚)：防漂移时间设为 8 秒，包容高强度的乐器和伴奏，最适合绝大多数的演唱会。
+• Live 现场演唱 (极柔气声/清唱)：VAD 敏感度更高，适合只有钢琴伴奏、或者歌手极度轻柔呢喃的特种 Live。
+• 访谈 / 电台播客：防霸屏时间设为 5 秒，快速断句，适合纯说话、无伴奏的场景。
+
+【🎸 分离策略 (Demucs)】
+• 开启分离 (必选)：只要背景有伴奏、BGM、乐器，就必须开启！否则底层 Whisper 会产生严重的时间轴幻觉。
+• 强制跳过：仅适用于【完全没有背景音乐】的纯人声电台、播客。跳过分离可节省大量时间和电脑内存。
+
+【🧠 引擎精度与模型性格 (Whisper)】
+• large-v2 (日音战神/推荐)：极其沉稳、抗噪，对背景杂音有"钝感力"，极难产生幻觉。Live 现场的首选！
+• large-v3-turbo (极速刺客)：速度是 v2 的数倍，体积小巧。但极其敏感，适合无伴奏的长播客或纯净人声。
+• large-v3 (高精放大镜)：词汇量最大，对微小声音极度敏感。不推荐用于音乐现场，容易把残留乐器声听成幻觉。
+• medium / small (轻量救星)：速度快、省显存。适合显卡显存低于 6GB 的用户，但在复杂场景下准确率会下降。
+
+【🌍 大模型 API (翻译阶段)】
+• 推荐主力：SiliconFlow (硅基流动)。采用 DeepSeek-V3 作为主力，国内直连无需梯子，速度快且不易被封禁断连。
+• 自定义接口：支持任何兼容 OpenAI 格式的 API。只需要在下拉框选择 [完全自定义]，填入供应商提供的 Base URL (必须以 /v1 结尾) 和对应的模型代号即可。
+• 代理支持：如果您使用的是国外大模型 (如 Google Gemini)，请务必在底部的 [本地代理] 框填入您梯子的端口号，例如 "http://127.0.0.1:10808" 或 "socks5://127.0.0.1:10808"。
+
+【💡 其他高阶提示】
+1. 盲翻模式：如果在右侧不贴入日文参考歌词本，大模型将完全凭借发音去自由翻译（适合访谈播客）。
+2. 断点续传：程序意外中断（或您手动停止）后，只要不修改打轴参数，再次运行会自动跳过已完成的人声分离和听写阶段，直接进入翻译！
+        """.strip()
+        
+        help_textbox.insert("1.0", help_text)
+        help_textbox.configure(state="disabled") 
+
     def _build_sidebar(self):
         self.sidebar = ctk.CTkFrame(self, width=380, corner_radius=0, fg_color=BG_SIDEBAR)
         self.sidebar.grid(row=0, column=0, sticky="nsew")
-        self.sidebar.grid_rowconfigure(10, weight=1)
+        
+        self.sidebar.grid_rowconfigure(5, weight=1)
 
         self.logo_label = ctk.CTkLabel(self.sidebar, text="UtaSync", font=ctk.CTkFont(family="Segoe UI Black", size=42, weight="bold"), text_color=TEXT_TITLE)
-        self.logo_label.grid(row=0, column=0, padx=40, pady=(55, 0), sticky="w")
+        self.logo_label.grid(row=0, column=0, padx=40, pady=(45, 0), sticky="w")
+        
         self.subtitle_label = ctk.CTkLabel(self.sidebar, text="Auto Subtitle Pipeline", font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"), text_color=TEXT_MUTED)
-        self.subtitle_label.grid(row=1, column=0, padx=42, pady=(0, 40), sticky="w")
+        self.subtitle_label.grid(row=1, column=0, padx=42, pady=(0, 15), sticky="w")
 
-        self.import_btn = ctk.CTkButton(self.sidebar, text="导入视音频源文件", font=ctk.CTkFont(family="Microsoft YaHei", size=14, weight="bold"), height=50, corner_radius=25, fg_color="#222222", hover_color="#333333", text_color=ACCENT_PRIMARY, command=self.import_video)
-        self.import_btn.grid(row=2, column=0, padx=40, pady=(0, 10), sticky="ew")
+        self.help_btn = ctk.CTkButton(self.sidebar, text="📖 参数指南说明", font=ctk.CTkFont(family="Microsoft YaHei", size=11, weight="bold"), width=110, height=26, fg_color="#181818", hover_color="#2A2A2A", text_color=TEXT_MUTED, corner_radius=6, command=self.show_help_dialog)
+        self.help_btn.grid(row=2, column=0, padx=40, pady=(0, 25), sticky="w")
+
+        self.import_btn = ctk.CTkButton(self.sidebar, text="导入视音频源文件", font=ctk.CTkFont(family="Microsoft YaHei", size=14, weight="bold"), height=45, corner_radius=22, fg_color="#222222", hover_color="#333333", text_color=ACCENT_PRIMARY, command=self.import_video)
+        self.import_btn.grid(row=3, column=0, padx=40, pady=(0, 5), sticky="ew")
         
-        self.file_label = ctk.CTkLabel(self.sidebar, text="未选择任何媒体", font=ctk.CTkFont(family="Microsoft YaHei", size=12), text_color="#555555", wraplength=300, justify="left")
-        self.file_label.grid(row=3, column=0, padx=45, pady=(0, 20), sticky="w")
+        self.file_label = ctk.CTkLabel(self.sidebar, text="未选择任何媒体", font=ctk.CTkFont(family="Microsoft YaHei", size=11), text_color="#555555", wraplength=300, justify="left")
+        self.file_label.grid(row=4, column=0, padx=45, pady=(0, 15), sticky="w")
 
-        self.settings_group = ctk.CTkFrame(self.sidebar, fg_color=BG_GROUP, corner_radius=16)
-        self.settings_group.grid(row=4, column=0, padx=40, pady=(0, 20), sticky="ew")
+        self.settings_group = ctk.CTkScrollableFrame(
+            self.sidebar, fg_color=BG_GROUP, corner_radius=16, 
+            scrollbar_button_color="#2A2A2A", scrollbar_button_hover_color="#444444"
+        )
+        self.settings_group.grid(row=5, column=0, padx=25, pady=(0, 15), sticky="nsew")
         self.settings_group.grid_columnconfigure(0, weight=1)
+        
+        row_idx = 0
 
-        self._add_group_label(self.settings_group, "声学模型 (Acoustic)", 0)
+        self._add_group_label(self.settings_group, "声学模型 (Acoustic)", row_idx); row_idx += 1
         self.opt_audio_type = ctk.CTkOptionMenu(self.settings_group, font=ctk.CTkFont(family="Microsoft YaHei", size=13), values=["Live 现场演唱 (常规/摇滚)", "Live 现场演唱 (极柔气声/清唱)", "访谈 / 电台播客"], fg_color="#222222", text_color=TEXT_TITLE, button_color="#222222", button_hover_color="#2A2A2A")
-        
-        saved_audio_type = self.settings.get("audio_type", "Live 现场演唱 (常规/摇滚)")
-        if saved_audio_type == "Live 现场演唱": saved_audio_type = "Live 现场演唱 (常规/摇滚)"
-        self.opt_audio_type.set(saved_audio_type)
-        
-        self.opt_audio_type.grid(row=1, column=0, padx=20, pady=(0, 15), sticky="ew")
-        self._add_group_divider(self.settings_group, 2)
+        self.opt_audio_type.set(self.settings.get("audio_type", "Live 现场演唱 (常规/摇滚)"))
+        self.opt_audio_type.grid(row=row_idx, column=0, padx=15, pady=(0, 10), sticky="ew"); row_idx += 1
+        self._add_group_divider(self.settings_group, row_idx); row_idx += 1
 
-        self._add_group_label(self.settings_group, "人声分离与VAD策略 (Demucs)", 3)
+        self._add_group_label(self.settings_group, "分离策略 (Demucs)", row_idx); row_idx += 1
         self.opt_demucs = ctk.CTkOptionMenu(self.settings_group, font=ctk.CTkFont(family="Microsoft YaHei", size=13), values=["开启分离 (Live音乐必选)", "强制跳过 (极速/仅限无伴奏访谈)"], fg_color="#222222", text_color=TEXT_TITLE, button_color="#222222", button_hover_color="#2A2A2A")
-        
-        saved_demucs = self.settings.get("use_demucs", "开启分离 (Live音乐必选)")
-        if "开启分离" in saved_demucs: saved_demucs = "开启分离 (Live音乐必选)"
-        elif "强制跳过" in saved_demucs: saved_demucs = "强制跳过 (极速/仅限无伴奏访谈)"
-        
-        self.opt_demucs.set(saved_demucs)
-        self.opt_demucs.grid(row=4, column=0, padx=20, pady=(0, 5), sticky="ew")
-        
-        hint_text = "* 提示: 只要有背景伴奏，请务必【开启分离】！\n  跳过分离仅适用于纯说话无伴奏的电台访谈。\n  (常规Live VAD=0.5，极柔气声 VAD=0.3)"
-        self.hint_label = ctk.CTkLabel(self.settings_group, text=hint_text, font=ctk.CTkFont(family="Microsoft YaHei", size=10), text_color=TEXT_HINT, justify="left")
-        self.hint_label.grid(row=5, column=0, padx=25, pady=(0, 15), sticky="w")
+        self.opt_demucs.set(self.settings.get("use_demucs", "开启分离 (Live音乐必选)"))
+        self.opt_demucs.grid(row=row_idx, column=0, padx=15, pady=(0, 10), sticky="ew"); row_idx += 1
+        self._add_group_divider(self.settings_group, row_idx); row_idx += 1
 
-        self._add_group_divider(self.settings_group, 6)
-
-        self._add_group_label(self.settings_group, "引擎精度 (Engine)", 7)
-        self.opt_model = ctk.CTkOptionMenu(self.settings_group, font=ctk.CTkFont(family="Microsoft YaHei", size=13), values=["large-v2 (战神级/推荐)", "medium (极速/省显存)", "large-v3"], fg_color="#222222", text_color=TEXT_TITLE, button_color="#222222", button_hover_color="#2A2A2A")
+        self._add_group_label(self.settings_group, "引擎精度 (Whisper)", row_idx); row_idx += 1
+        self.opt_model = ctk.CTkOptionMenu(self.settings_group, font=ctk.CTkFont(family="Microsoft YaHei", size=13), values=["large-v2 (战神级/推荐)", "large-v3-turbo (极速高精)", "large-v3", "medium (省显存)", "small", "base"], fg_color="#222222", text_color=TEXT_TITLE, button_color="#222222", button_hover_color="#2A2A2A")
         self.opt_model.set(self.settings.get("model_size", "large-v2 (战神级/推荐)"))
-        self.opt_model.grid(row=8, column=0, padx=20, pady=(0, 15), sticky="ew")
-        self._add_group_divider(self.settings_group, 9)
+        self.opt_model.grid(row=row_idx, column=0, padx=15, pady=(0, 10), sticky="ew"); row_idx += 1
+        self._add_group_divider(self.settings_group, row_idx); row_idx += 1
 
-        self._add_group_label(self.settings_group, "翻译配置 (Translation)", 10)
-        self.opt_api_provider = ctk.CTkOptionMenu(self.settings_group, font=ctk.CTkFont(family="Microsoft YaHei", size=13), values=["SiliconFlow (智能路由)", "Google Gemini"], fg_color="#222222", text_color=TEXT_TITLE, button_color="#222222", button_hover_color="#2A2A2A")
-        self.opt_api_provider.set(self.settings["api_provider"])
-        self.opt_api_provider.grid(row=11, column=0, padx=20, pady=(5, 10), sticky="ew")
+        self._add_group_label(self.settings_group, "大模型 API (智能路由 & 自定义)", row_idx); row_idx += 1
+        self.opt_api_preset = ctk.CTkOptionMenu(self.settings_group, font=ctk.CTkFont(family="Microsoft YaHei", size=13), values=["SiliconFlow (DeepSeek-V3)", "Kimi (月之暗面)", "Google Gemini", "完全自定义"], command=self.on_api_preset_change, fg_color="#222222", text_color=TEXT_TITLE, button_color="#222222", button_hover_color="#2A2A2A")
+        self.opt_api_preset.set(self.settings.get("api_preset", "SiliconFlow (DeepSeek-V3)"))
+        self.opt_api_preset.grid(row=row_idx, column=0, padx=15, pady=(0, 15), sticky="ew"); row_idx += 1
         
-        self.api_key_entry = ctk.CTkEntry(self.settings_group, font=ctk.CTkFont(family="Consolas", size=12), placeholder_text="粘贴 API Key...", show="*", height=36, fg_color="#121212", text_color=TEXT_TITLE, border_width=0, corner_radius=8)
-        self.api_key_entry.insert(0, self.settings["api_key"])
-        self.api_key_entry.grid(row=12, column=0, padx=20, pady=(0, 10), sticky="ew")
+        hint_font = ctk.CTkFont(family="Microsoft YaHei", size=11)
+        
+        self.lbl_url = ctk.CTkLabel(self.settings_group, text="Base URL (接口地址):", font=hint_font, text_color=TEXT_HINT)
+        self.lbl_url.grid(row=row_idx, column=0, padx=20, pady=(0, 2), sticky="w"); row_idx += 1
+        self.api_url_entry = ctk.CTkEntry(self.settings_group, font=ctk.CTkFont(family="Consolas", size=12), height=32, fg_color="#121212", text_color=TEXT_TITLE, border_width=0, corner_radius=8)
+        self.api_url_entry.insert(0, self.settings.get("api_url", "https://api.siliconflow.cn/v1"))
+        self.api_url_entry.grid(row=row_idx, column=0, padx=15, pady=(0, 10), sticky="ew"); row_idx += 1
 
-        self.proxy_entry = ctk.CTkEntry(self.settings_group, font=ctk.CTkFont(family="Consolas", size=12), placeholder_text="本地代理 (例如 http://127.0.0.1:10808) 留空直连", height=36, fg_color="#121212", text_color=TEXT_TITLE, border_width=0, corner_radius=8)
+        self.lbl_model = ctk.CTkLabel(self.settings_group, text="Model ID (模型代号):", font=hint_font, text_color=TEXT_HINT)
+        self.lbl_model.grid(row=row_idx, column=0, padx=20, pady=(0, 2), sticky="w"); row_idx += 1
+        self.api_model_entry = ctk.CTkEntry(self.settings_group, font=ctk.CTkFont(family="Consolas", size=12), height=32, fg_color="#121212", text_color=TEXT_TITLE, border_width=0, corner_radius=8)
+        self.api_model_entry.insert(0, self.settings.get("api_model", "deepseek-ai/DeepSeek-V3"))
+        self.api_model_entry.grid(row=row_idx, column=0, padx=15, pady=(0, 10), sticky="ew"); row_idx += 1
+        
+        self.lbl_key = ctk.CTkLabel(self.settings_group, text="API Key (您的密钥):", font=hint_font, text_color=TEXT_HINT)
+        self.lbl_key.grid(row=row_idx, column=0, padx=20, pady=(0, 2), sticky="w"); row_idx += 1
+        self.api_key_entry = ctk.CTkEntry(self.settings_group, font=ctk.CTkFont(family="Consolas", size=12), show="*", height=32, fg_color="#121212", text_color=TEXT_TITLE, border_width=0, corner_radius=8)
+        self.api_key_entry.insert(0, self.settings.get("api_key", ""))
+        self.api_key_entry.grid(row=row_idx, column=0, padx=15, pady=(0, 10), sticky="ew"); row_idx += 1
+
+        self.proxy_entry = ctk.CTkEntry(self.settings_group, font=ctk.CTkFont(family="Consolas", size=12), placeholder_text="本地代理 (例如 http://127.0.0.1:10808) 留空直连", height=32, fg_color="#121212", text_color=TEXT_TITLE, border_width=0, corner_radius=8)
         self.proxy_entry.insert(0, self.settings.get("proxy_url", ""))
-        self.proxy_entry.grid(row=13, column=0, padx=20, pady=(0, 10), sticky="ew")
+        self.proxy_entry.grid(row=row_idx, column=0, padx=15, pady=(0, 10), sticky="ew"); row_idx += 1
+        self._add_group_divider(self.settings_group, row_idx); row_idx += 1
 
+        self._add_group_label(self.settings_group, "排版模式 (Output)", row_idx); row_idx += 1
         self.opt_output_mode = ctk.CTkOptionMenu(self.settings_group, font=ctk.CTkFont(family="Microsoft YaHei", size=13), values=["中日双语字幕", "纯中文字幕"], fg_color="#222222", text_color=TEXT_TITLE, button_color="#222222", button_hover_color="#2A2A2A")
         self.opt_output_mode.set(self.settings.get("output_mode", "中日双语字幕"))
-        self.opt_output_mode.grid(row=14, column=0, padx=20, pady=(0, 15), sticky="ew")
+        self.opt_output_mode.grid(row=row_idx, column=0, padx=15, pady=(0, 15), sticky="ew"); row_idx += 1
 
         self.run_btn = ctk.CTkButton(self.sidebar, text="启动处理引擎", font=ctk.CTkFont(family="Microsoft YaHei", size=16, weight="bold"), height=55, corner_radius=27, text_color="#000000", fg_color=ACCENT_GREEN, hover_color="#1ED760", command=self.toggle_process)
-        self.run_btn.grid(row=15, column=0, padx=40, pady=(20, 10), sticky="ew")
+        self.run_btn.grid(row=6, column=0, padx=40, pady=(5, 10), sticky="ew")
 
-        self.progressbar = ctk.CTkProgressBar(self.sidebar, mode="determinate", height=3, fg_color=BG_SIDEBAR, progress_color=ACCENT_GREEN, corner_radius=2)
-        self.progressbar.grid(row=16, column=0, padx=60, pady=(0, 30), sticky="ew")
+        self.progressbar = ctk.CTkProgressBar(self.sidebar, mode="determinate", height=4, fg_color="#252525", progress_color=ACCENT_GREEN, corner_radius=2)
+        self.progressbar.grid(row=7, column=0, padx=60, pady=(0, 25), sticky="ew")
         self.progressbar.set(0) 
+
+    def on_api_preset_change(self, choice):
+        self.api_url_entry.delete(0, "end")
+        self.api_model_entry.delete(0, "end")
+        
+        if "SiliconFlow" in choice:
+            self.api_url_entry.insert(0, "https://api.siliconflow.cn/v1")
+            self.api_model_entry.insert(0, "deepseek-ai/DeepSeek-V3")
+        elif "Kimi" in choice:
+            self.api_url_entry.insert(0, "https://api.moonshot.cn/v1")
+            self.api_model_entry.insert(0, "moonshot-v1-32k")
+        elif "Gemini" in choice:
+            self.api_url_entry.insert(0, "https://generativelanguage.googleapis.com/v1beta/openai/")
+            self.api_model_entry.insert(0, "gemini-2.5-flash")
+        else:
+            self.api_url_entry.insert(0, "")
+            self.api_model_entry.insert(0, "")
 
     def _add_group_label(self, parent, text, row):
         label = ctk.CTkLabel(parent, text=text, font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"), text_color=TEXT_MUTED)
-        label.grid(row=row, column=0, padx=25, pady=(15, 5), sticky="w")
+        label.grid(row=row, column=0, padx=25, pady=(10, 5), sticky="w")
 
     def _add_group_divider(self, parent, row):
         divider = ctk.CTkFrame(parent, height=1, fg_color="#252525")
-        divider.grid(row=row, column=0, padx=20, pady=(0, 5), sticky="ew")
+        divider.grid(row=row, column=0, padx=15, pady=(0, 5), sticky="ew")
 
     def _build_main_workspace(self):
         self.main_frame = ctk.CTkFrame(self, fg_color=BG_WORKSPACE, corner_radius=0)
@@ -246,7 +320,6 @@ class UtaSyncApp(ctk.CTk):
         self.lyrics_textbox = ctk.CTkTextbox(self.lyrics_panel, height=200, fg_color="#1A1A1A", text_color="#CCCCCC", border_width=0, font=ctk.CTkFont(family="Microsoft YaHei", size=14), corner_radius=10)
         self.lyrics_textbox.grid(row=1, column=0, padx=25, pady=(0, 25), sticky="nsew")
         
-        # 🌟 核心提取：载入上次退出时保存的歌词，如果没有则显示默认提示
         default_placeholder = "【留空即为盲翻】\n请将网易云/QQ音乐的日文歌词粘贴于此...\n\nねぇ、もしも全て投げ捨てられたら\n笑って生きることが楽になるの？"
         saved_lyrics = self.settings.get("cached_lyrics", "")
         self.lyrics_textbox.insert("1.0", saved_lyrics if saved_lyrics else default_placeholder)
@@ -276,7 +349,6 @@ class UtaSyncApp(ctk.CTk):
 
     def toggle_process(self):
         if self.is_running:
-            # 🌟 升级文案，告知用户可以直接取消
             response = messagebox.askyesno(
                 "终止任务", 
                 "⚠️ 确定要终止当前任务吗？\n\n系统已升级【深层安全中断】机制，将立即切断底层的 AI 运算和显存占用，不再需要漫长等待！"
@@ -290,13 +362,12 @@ class UtaSyncApp(ctk.CTk):
             messagebox.showwarning("警告", "请先在左侧导入媒体文件！")
             return
         
-        # 每次点击开始时，也自动覆盖保存一下当前状态（以防中途强退）
         self.save_all_ui_states()
         self.cancel_event.clear()
 
         raw_lyrics = self.lyrics_textbox.get("1.0", "end-1c").strip()
         lyrics_text = "" if "【留空即为盲翻】" in raw_lyrics else raw_lyrics
-        trans_state_string = f"{lyrics_text}__{self.settings['output_mode']}__{self.settings['api_provider']}"
+        trans_state_string = f"{lyrics_text}__{self.settings['output_mode']}__{self.settings['api_url']}__{self.settings['api_model']}"
         current_trans_hash = hashlib.md5(trans_state_string.encode('utf-8')).hexdigest()
 
         asr_state_string = f"{self.settings['audio_type']}__{self.settings['use_demucs']}__{self.settings['model_size']}"
@@ -344,7 +415,7 @@ class UtaSyncApp(ctk.CTk):
             elif current_trans_hash != saved_trans_hash:
                 messagebox.showinfo(
                     "🧠 翻译配置已变更", 
-                    "侦测到您修改了【参考歌词】或【排版/翻译配置】！\n\n为防止采用旧缓存导致前后翻译格式错乱，系统已自动为您隔离了旧数据。\n\n本次将采用您的新配置进行全新翻译！"
+                    "侦测到您修改了【参考歌词】或【接口/排版配置】！\n\n为防止采用旧缓存导致前后翻译格式错乱，系统已自动为您隔离了旧数据。\n\n本次将采用您的新配置进行全新翻译！"
                 )
                 print("\n🧠 [智能管家] 侦测到配置更改，旧翻译缓存已安全废弃，准备全新翻译。")
                 clear_cache = True
@@ -374,7 +445,10 @@ class UtaSyncApp(ctk.CTk):
                 audio_type = "live"
                 
             model_size = self.opt_model.get().split(" ")[0]
-            api_provider = self.opt_api_provider.get()
+            
+            base_url = self.api_url_entry.get().strip()
+            p_model = self.api_model_entry.get().strip()
+            
             api_key = self.api_key_entry.get().strip()
             proxy_url = self.proxy_entry.get().strip() 
             output_mode = "chinese_only" if "纯中文" in self.opt_output_mode.get() else "bilingual"
@@ -405,7 +479,6 @@ class UtaSyncApp(ctk.CTk):
             else:
                 self.after(0, self.update_ui_status, 0.1, "⏹ 取消任务 (打轴中...)")
                 generator = LiveSubtitleGenerator(video_path=self.video_path)
-                # 🌟 传递 cancel_event 到 generator
                 srt_path = generator.run(model_size=model_size, audio_type=audio_type, skip_separation=skip_sep, cancel_event=self.cancel_event)
                 if not srt_path: raise Exception("打轴阶段未能返回有效的 SRT 路径。")
                 
@@ -424,13 +497,16 @@ class UtaSyncApp(ctk.CTk):
 
             if api_key:
                 self.after(0, self.update_ui_status, 0.6, "⏹ 取消任务 (AI翻译中...)")
-                print("\n🌍 [大模型矩阵启动] 开始执行听译与纠错排版...")
-                if "Gemini" in api_provider:
-                    base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
-                    p_model, r_model = "gemini-2.5-flash", "gemini-2.5-pro"
-                else:
-                    base_url = "https://api.siliconflow.cn/v1"
-                    p_model, r_model = "deepseek-ai/DeepSeek-V3", "deepseek-ai/DeepSeek-R1"
+                
+                print(f"\n🌍 [大模型矩阵启动] 开始执行听译与纠错排版...")
+                print(f"   -> 🌐 目标接口: {base_url}")
+                print(f"   -> 🧠 加载模型: {p_model}")
+                
+                r_model = p_model 
+                if "gemini-2.5-flash" in p_model:
+                    r_model = "gemini-2.5-pro"
+                elif "DeepSeek-V3" in p_model:
+                    r_model = "deepseek-ai/DeepSeek-R1"
 
                 temp_lyrics_path = os.path.join(output_dir, "temp_lyrics_gui.txt")
                 with open(temp_lyrics_path, "w", encoding="utf-8") as f: 
@@ -446,7 +522,6 @@ class UtaSyncApp(ctk.CTk):
                     output_mode=output_mode,
                     proxy_url=proxy_url 
                 )
-                # 🌟 传递 cancel_event 到 translator
                 final_srt = translator.run(cancel_event=self.cancel_event)
                 
                 if os.path.exists(temp_lyrics_path): 
@@ -467,7 +542,6 @@ class UtaSyncApp(ctk.CTk):
             time.sleep(1.5) 
 
         except Exception as e:
-            # 🌟 如果是用户主动终止，不显示为红色的“异常终止”，显示为灰色
             if "用户中断" in str(e):
                 print(f"\n🛑 任务已由用户手动终止。")
                 self.after(0, self.update_ui_status, 0.0, "🛑 任 务 已 中 止")
@@ -477,6 +551,10 @@ class UtaSyncApp(ctk.CTk):
             time.sleep(2)
         finally:
             self.is_running = False
+            
+            # 🌟 终极防闪退补丁 2：在线程彻底死亡前，强行清空所有遗留内存
+            gc.collect()
+            
             self.after(0, lambda: self.run_btn.configure(text="启动处理引擎", state="normal", fg_color=ACCENT_GREEN, hover_color="#1ED760", text_color="#000000"))
             self.after(0, lambda: self.progressbar.set(0.0))
 
