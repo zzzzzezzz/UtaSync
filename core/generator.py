@@ -54,10 +54,24 @@ class LiveSubtitleGenerator:
         self.cancel_event = None 
 
     def _run_cmd(self, cmd, hide_output=True, task_name=None):
-        """🌟 进程级安全秒杀器 + 智能心跳监测"""
-        out_target = subprocess.DEVNULL if hide_output else None
-        process = subprocess.Popen(cmd, stdout=out_target, stderr=out_target)
+        """🌟 进程级安全秒杀器 + 智能心跳监测 + 底层报错透传"""
+        log_path = os.path.join(self.audio_dir, "last_cmd.log")
+        out_file = None
         
+        if hide_output:
+            out_file = open(log_path, "w", encoding="utf-8", errors="ignore")
+            
+        try:
+            process = subprocess.Popen(
+                cmd, 
+                stdout=out_file if hide_output else None, 
+                stderr=subprocess.STDOUT if hide_output else None,
+                text=True, encoding="utf-8", errors="ignore"
+            )
+        except FileNotFoundError:
+            if out_file: out_file.close()
+            raise Exception(f"🚨 系统找不到核心工具 [{cmd[0]}.exe]！\n💡 解决方案：您的环境变量可能未生效，请彻底重启编辑器；或直接将 {cmd[0]}.exe 复制到 app.py 所在的文件夹中！")
+            
         start_time = time.time()
         last_heartbeat = start_time
         
@@ -65,9 +79,9 @@ class LiveSubtitleGenerator:
             if self.cancel_event and self.cancel_event.is_set():
                 process.kill()
                 process.wait()
+                if out_file: out_file.close()
                 raise Exception("用户中断：已安全切断外部进程 (FFmpeg/Demucs)")
             
-            # 🌟 优化：把 10 秒改成 30 秒，既能报平安，又不会刷屏
             if task_name:
                 current_time = time.time()
                 if current_time - last_heartbeat >= 30:
@@ -76,6 +90,20 @@ class LiveSubtitleGenerator:
                     last_heartbeat = current_time
 
             time.sleep(0.5)
+            
+        if out_file:
+            out_file.close()
+            
+        if process.returncode != 0:
+            err_msg = "未能捕获到底层输出。请检查环境。"
+            if hide_output and os.path.exists(log_path):
+                with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read().strip()
+                    if content:
+                        err_msg = content[-1500:] 
+            
+            raise Exception(f"进程异常退出 (退出码: {process.returncode})。\n[🔍 底层真实报错日志]：\n{err_msg}")
+            
         return process.returncode
 
     def extract_audio(self):
@@ -92,76 +120,91 @@ class LiveSubtitleGenerator:
         self._run_cmd(command, hide_output=True, task_name="音频提取")
         return self.audio_path
 
-    def isolate_vocals(self, skip=False):
+    def isolate_vocals(self, skip=False, hardware_mode="low"):
         if skip:
             print(f"⏩ [步骤 2/4] 极速模式：已跳过 Demucs 人声分离，直接使用源音频！")
             self.vocal_path = self.audio_path
             return self.vocal_path
 
-        duration = 0
-        try:
-            cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', self.audio_path]
-            res = subprocess.run(cmd, stdout=subprocess.PIPE, text=True)
-            duration = float(res.stdout.strip())
-        except Exception:
-            pass
-
         print(f"🎸 [步骤 2/4] 正在使用 Demucs 高精模型分离人声...")
         
-        if duration > 1200:
-            print(f"   -> ⚠️ 检测到超长音频 (约 {int(duration//60)} 分钟)！")
-            print(f"   -> 🛡️ 启动【无缝切片防爆内存】引擎，将分段处理以保护您的电脑...")
-            
-            chunks_dir = os.path.join(self.audio_dir, "chunks")
-            os.makedirs(chunks_dir, exist_ok=True)
-            
-            chunk_pattern = os.path.join(chunks_dir, "chunk_%03d.wav")
-            self._run_cmd(["ffmpeg", "-i", self.audio_path, "-f", "segment", "-segment_time", "1200", "-c", "copy", chunk_pattern, "-y"], hide_output=True)
-            
-            chunks = sorted(glob.glob(os.path.join(chunks_dir, "chunk_*.wav")))
-            vocal_chunks = []
-            
-            for i, chunk_file in enumerate(chunks):
-                print(f"      -> 正在提取分段 {i+1}/{len(chunks)} 的人声 (安全运行中)...")
-                self._run_cmd(["demucs", "-n", "htdemucs_ft", "--two-stems=vocals", "-o", chunks_dir, chunk_file], hide_output=True, task_name=f"人声分离 (第 {i+1} 分段)")
-                
-                chunk_name = os.path.splitext(os.path.basename(chunk_file))[0]
-                chunk_vocal = os.path.join(chunks_dir, "htdemucs_ft", chunk_name, "vocals.wav")
-                if os.path.exists(chunk_vocal):
-                    vocal_chunks.append(chunk_vocal)
-
-            print(f"   -> 🧩 所有分段处理完毕，正在无缝拼接最终人声...")
-            concat_txt = os.path.join(chunks_dir, "concat.txt")
-            with open(concat_txt, "w", encoding="utf-8") as f:
-                for vc in vocal_chunks:
-                    safe_path = vc.replace('\\', '/')
-                    f.write(f"file '{safe_path}'\n")
-                    
-            self._run_cmd(["ffmpeg", "-f", "concat", "-safe", "0", "-i", concat_txt, "-c", "copy", self.final_vocal_path, "-y"], hide_output=True)
-            self.vocal_path = self.final_vocal_path
-            
-            shutil.rmtree(chunks_dir, ignore_errors=True)
-            print("   -> ✅ 拼接完成！内存防爆机制运行成功。")
-            return self.vocal_path
-            
+        # 🌟 算力调度核心逻辑：根据传进来的 hardware_mode 动态分配胃口
+        segment_args = []
+        if hardware_mode == "high":
+            chunk_length = "1800" 
+            print(f"   -> 🚀 启动【满血狂飙】引擎，解除所有显存封印 (每 {chunk_length} 秒一段)...")
+        elif hardware_mode == "medium":
+            chunk_length = "180"  
+            print(f"   -> ⚖️ 启动【均衡提速】引擎，兼顾速度与稳定 (每 {chunk_length} 秒一段)...")
         else:
-            command = [
-                "demucs", "-n", "htdemucs_ft", "--two-stems=vocals", 
-                "-o", self.output_dir, self.audio_path
-            ]
-            self._run_cmd(command, hide_output=True, task_name="高精人声分离")
+            chunk_length = "60"   
+            segment_args = ["--segment", "2"] 
+            print(f"   -> 🛡️ 启动【极限防爆】引擎，物理锁死显存峰值 (每 {chunk_length} 秒一段)...")
+        
+        chunks_dir = os.path.join(self.audio_dir, "chunks")
+        os.makedirs(chunks_dir, exist_ok=True)
+        
+        chunk_pattern = os.path.join(chunks_dir, "chunk_%03d.wav")
+        self._run_cmd(["ffmpeg", "-i", self.audio_path, "-f", "segment", "-segment_time", chunk_length, "-c", "copy", chunk_pattern, "-y"], hide_output=True)
+        
+        # 🌟 核心修复：弃用 glob，改用 os.listdir，彻底免疫文件名中的 [] 等特殊符号！
+        chunks = []
+        if os.path.exists(chunks_dir):
+            for f in os.listdir(chunks_dir):
+                if f.startswith("chunk_") and f.endswith(".wav"):
+                    chunks.append(os.path.join(chunks_dir, f))
+        chunks = sorted(chunks)
+
+        vocal_chunks = []
+        
+        if not chunks:
+            raise Exception("音频切片失败，无法生成分段文件。请检查音频源。")
+
+        for i, chunk_file in enumerate(chunks):
+            status_msg = f"正在提取分段 {i+1}/{len(chunks)} 的人声..."
+            if hardware_mode == "low": status_msg += " (极致锁死显存中)"
+            elif hardware_mode == "high": status_msg += " (算力火力全开中)"
+            print(f"      -> {status_msg}")
             
-            vocal_path = os.path.join(self.output_dir, "htdemucs_ft", f"{self.safe_name}_源音频", "vocals.wav")
-            if os.path.exists(vocal_path):
-                self.vocal_path = vocal_path
-                return self.vocal_path
+            cmd = [
+                "demucs", "-n", "htdemucs_ft", 
+                "--two-stems=vocals"
+            ] + segment_args + [
+                "-o", chunks_dir, chunk_file
+            ]
+            
+            try:
+                self._run_cmd(cmd, hide_output=True, task_name=f"人声分离 (第 {i+1} 分段)")
+            except Exception as e:
+                raise Exception(f"Demucs 在处理第 {i+1} 个切片时彻底崩溃！\n{str(e)}")
+                
+            chunk_name = os.path.splitext(os.path.basename(chunk_file))[0]
+            chunk_vocal = os.path.join(chunks_dir, "htdemucs_ft", chunk_name, "vocals.wav")
+            if os.path.exists(chunk_vocal):
+                vocal_chunks.append(chunk_vocal)
             else:
-                raise FileNotFoundError("找不到分离后的人声文件。请检查源音频是否存在。")
+                 print(f"      -> ⚠️ 警告：找不到分段 {i+1} 的分离人声，可能该片段极其短暂或出错了。")
+
+        if not vocal_chunks:
+            raise Exception("所有分段处理完毕，但未能提取到任何人声文件！")
+
+        print(f"   -> 🧩 所有分段处理完毕，正在无缝拼接最终人声...")
+        concat_txt = os.path.join(chunks_dir, "concat.txt")
+        with open(concat_txt, "w", encoding="utf-8") as f:
+            for vc in vocal_chunks:
+                safe_path = vc.replace('\\', '/')
+                f.write(f"file '{safe_path}'\n")
+                
+        self._run_cmd(["ffmpeg", "-f", "concat", "-safe", "0", "-i", concat_txt, "-c", "copy", self.final_vocal_path, "-y"], hide_output=True)
+        self.vocal_path = self.final_vocal_path
+        
+        shutil.rmtree(chunks_dir, ignore_errors=True)
+        print("   -> ✅ 拼接完成！音频分离调度机制运行成功。")
+        return self.vocal_path
 
     def transcribe_to_srt(self, model_size="large-v2", audio_type="live", skipped_demucs=False):
         print(f"📝 [步骤 3/4] 正在加载/下载 Faster-Whisper ({model_size}) 模型...")
         
-        # 🌟 新增：动态模型性格提示，让用户在控制台也能吃下定心丸
         if "large-v2" in model_size:
             print("   -> 💡 模型特性: [日音战神] 沉稳抗噪，对残留乐器有钝感力，极难产生幻觉，Live 现场首选！")
         elif "large-v3-turbo" in model_size:
@@ -171,7 +214,6 @@ class LiveSubtitleGenerator:
         elif "medium" in model_size or "small" in model_size or "base" in model_size:
             print("   -> 💡 模型特性: [轻量救星] 速度极快、极省显存。适合低配电脑，但复杂场景下准确率会下降。")
 
-        # 🌟 核心高 ROI 补丁：给用户的强预警，缓解下载时的焦虑
         print(f"   -> 💡 下载提示: 若首次使用此模型，系统正从云端下载权重 (约 1.5G~3G)。")
         print(f"   -> ⏳ 下载过程根据网速可能需要 3~15 分钟，后台正在拼命拉取，请勿关闭软件...")
         
@@ -186,7 +228,6 @@ class LiveSubtitleGenerator:
             print("   -> 🚀 模型准备就绪，成功启用 GPU 显卡加速！")
         except Exception as e:
             error_msg = str(e).lower()
-            # 🌟 核心修复：精准识别网络超时，防止误判为 GPU 崩溃而引发二次连环闪退
             if "timeout" in error_msg or "connection" in error_msg or "urllib3" in error_msg or "read operation timed out" in error_msg:
                 raise Exception("模型下载超时！由于文件较大，您的网络中途断开。\n💡 别担心！系统已保存下载进度，请再次点击「启动」，它会自动【断点续传】！")
             
@@ -308,7 +349,7 @@ class LiveSubtitleGenerator:
         milliseconds = int((seconds - int(seconds)) * 1000)
         return f"{hours:02d}:{minutes:02d}:{secs:02d},{milliseconds:03d}"
 
-    def run(self, model_size="large-v2", audio_type="live", skip_separation=False, cancel_event=None):
+    def run(self, model_size="large-v2", audio_type="live", skip_separation=False, hardware_mode="low", cancel_event=None):
         self.cancel_event = cancel_event
         start_time = time.time() 
         try:
@@ -333,7 +374,7 @@ class LiveSubtitleGenerator:
                     os.remove(self.final_vocal_path) 
                     
                 self.extract_audio()
-                self.isolate_vocals(skip=skip_separation) 
+                self.isolate_vocals(skip=skip_separation, hardware_mode=hardware_mode) 
                 
                 with open(self.strategy_flag_path, "w", encoding="utf-8") as f:
                     f.write(current_strategy)
@@ -347,7 +388,6 @@ class LiveSubtitleGenerator:
             secs = int(elapsed_time % 60)
             print(f"\n⏱️ [性能报告] 音频提取与打轴总耗时: {mins} 分 {secs} 秒")
             
-            # 🌟 终极防闪退补丁 1：手动超度底层 C++ 占用的显卡模型，绝不留给 Python 自动回收！
             if hasattr(self, 'model') and self.model is not None:
                 del self.model
                 self.model = None
