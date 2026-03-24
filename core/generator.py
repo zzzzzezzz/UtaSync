@@ -6,6 +6,7 @@ import hashlib
 import shutil
 import glob
 import gc
+import torch
 from faster_whisper import WhisperModel 
 
 # 🌟 限制底层 AI 引擎的核心数，防止 CPU 满载卡死
@@ -21,6 +22,7 @@ os.environ["http_proxy"] = ""
 os.environ["https_proxy"] = ""
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
+# 🌟 神级补丁：自动扫描并注册 NVIDIA 显卡 DLL，解决 PyInstaller 打包后漏文件报错！
 try:
     import nvidia
     nvidia_base = None
@@ -54,20 +56,27 @@ class LiveSubtitleGenerator:
         self.cancel_event = None 
 
     def _run_cmd(self, cmd, hide_output=True, task_name=None):
-        """🌟 进程级安全秒杀器 + 智能心跳监测 + 底层报错透传"""
+        """🌟 进程级安全秒杀器 + 智能心跳监测 + 底层报错透传 (彻底解决黑框版)"""
         log_path = os.path.join(self.audio_dir, "last_cmd.log")
         out_file = None
         
         if hide_output:
             out_file = open(log_path, "w", encoding="utf-8", errors="ignore")
             
+        popen_kwargs = {
+            "stdout": out_file if hide_output else None,
+            "stderr": subprocess.STDOUT if hide_output else None,
+            "text": True, 
+            "encoding": "utf-8", 
+            "errors": "ignore"
+        }
+        
+        # 🌟 核心修复：强制屏蔽 Windows 命令行黑框弹窗
+        if sys.platform == "win32":
+            popen_kwargs["creationflags"] = 0x08000000
+            
         try:
-            process = subprocess.Popen(
-                cmd, 
-                stdout=out_file if hide_output else None, 
-                stderr=subprocess.STDOUT if hide_output else None,
-                text=True, encoding="utf-8", errors="ignore"
-            )
+            process = subprocess.Popen(cmd, **popen_kwargs)
         except FileNotFoundError:
             if out_file: out_file.close()
             raise Exception(f"🚨 系统找不到核心工具 [{cmd[0]}.exe]！\n💡 解决方案：您的环境变量可能未生效，请彻底重启编辑器；或直接将 {cmd[0]}.exe 复制到 app.py 所在的文件夹中！")

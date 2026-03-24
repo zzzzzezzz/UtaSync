@@ -1,5 +1,66 @@
 import os
 import sys
+
+# ==========================================
+# 🌟 终极显卡动态链接库 (DLL) 强制寻路补丁
+# 解决 Python 3.8+ 在 Windows 下无法加载深层 DLL 的大坑
+# 必须放在所有其他 import 之前执行！
+# ==========================================
+if sys.platform == "win32":
+    try:
+        # 1. 针对 PyInstaller 运行时的目录注入
+        base_dir = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+        # 有时打包文件在同级的 _internal 目录里
+        internal_dir = os.path.join(base_dir, "_internal")
+        search_dirs = [base_dir, internal_dir] if os.path.exists(internal_dir) else [base_dir]
+        
+        for s_dir in search_dirs:
+            dll_paths = [
+                s_dir,
+                os.path.join(s_dir, "torch", "lib"),          # 🌟 关键修复：PyTorch 本家自带的满血显卡 DLL 目录
+                os.path.join(s_dir, "nvidia", "cublas", "bin"),
+                os.path.join(s_dir, "nvidia", "cudnn", "bin"),
+                os.path.join(s_dir, "nvidia", "cufft", "bin"),
+                os.path.join(s_dir, "nvidia", "curand", "bin"),
+                os.path.join(s_dir, "nvidia", "cusolver", "bin"),
+                os.path.join(s_dir, "nvidia", "cusparse", "bin"),
+                os.path.join(s_dir, "nvidia", "nvtx", "bin"),
+            ]
+            for p in dll_paths:
+                if os.path.exists(p):
+                    os.environ["PATH"] = p + os.pathsep + os.environ.get("PATH", "")
+                    if hasattr(os, 'add_dll_directory'):
+                        try:
+                            os.add_dll_directory(p)
+                        except Exception:
+                            pass
+    except Exception:
+        pass
+
+    # 2. 针对源码直接运行的动态注入
+    try:
+        import torch
+        torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
+        if os.path.exists(torch_lib):
+            os.environ["PATH"] = torch_lib + os.pathsep + os.environ.get("PATH", "")
+            if hasattr(os, 'add_dll_directory'):
+                try: os.add_dll_directory(torch_lib)
+                except: pass
+    except ImportError:
+        pass
+        
+    try:
+        import nvidia
+        nvidia_base = os.path.dirname(nvidia.__file__)
+        for root, dirs, files in os.walk(nvidia_base):
+            if any(f.endswith('.dll') for f in files):
+                os.environ["PATH"] = root + os.pathsep + os.environ.get("PATH", "")
+                if hasattr(os, 'add_dll_directory'):
+                    try: os.add_dll_directory(root)
+                    except: pass
+    except ImportError:
+        pass
+
 import json
 import time
 import threading
@@ -14,12 +75,22 @@ import customtkinter as ctk
 from tkinter import filedialog, messagebox
 
 try:
+    from PIL import Image, ImageTk
+except ImportError:
+    pass
+
+# ==========================================
+# 🚀 核心架构升级：启动器模式 (Launcher Mode) 智能检测
+# ==========================================
+try:
     from core.generator import LiveSubtitleGenerator
     from core.translator import SubtitleTranslator
     from core.ass_maker import ASSMaker, ASS_PRESETS 
-except ImportError as e:
-    print(f"⚠️ 核心引擎导入失败: {e}\n请确保 app.py 与 core 文件夹在同一级目录下。")
-    ASS_PRESETS = {} 
+    ENGINE_READY = True
+except (ImportError, ModuleNotFoundError) as e:
+    print(f"⚠️ 检测到处于轻量启动器模式 (核心引擎未挂载): {e}\n系统将以 Launcher 形态运行。")
+    ENGINE_READY = False
+    ASS_PRESETS = {"默认双语 (纯白+浅灰)": {}}
 
 # ==========================================
 # 🎨 终极高级感调色板
@@ -33,13 +104,13 @@ ACCENT_PRIMARY = "#FFFFFF"
 ACCENT_GREEN = "#1DB954"   
 ACCENT_RED = "#991B1B"     
 ACCENT_RED_HOVER = "#7F1D1D"
+ACCENT_WARNING = "#EAB308" 
 
 TEXT_TITLE = "#FFFFFF"     
 TEXT_MUTED = "#888888"     
 TEXT_HINT = "#666666"      
 
 ctk.set_appearance_mode("dark")
-
 SETTINGS_FILE = "user_settings.json"
 
 def load_settings():
@@ -57,14 +128,10 @@ def load_settings():
         "output_mode": "中日双语字幕", "use_demucs": "开启分离 (Live音乐必选)",
         "hardware_mode": "极限防爆 (4G~6G显存/默认)",
         "ass_preset": "默认双语 (纯白+浅灰)", 
-        "ch_font_override": "跟随预设",
-        "jp_font_override": "跟随预设",
-        "ch_size_override": "跟随预设",  
-        "jp_size_override": "跟随预设",  
+        "ch_font_override": "跟随预设", "jp_font_override": "跟随预设",
+        "ch_size_override": "跟随预设", "jp_size_override": "跟随预设",  
         "fade_mode": "智能动态呼吸 (默认/推荐)", 
-        "hires_export": False, 
-        "proxy_url": "",
-        "cached_lyrics": "" 
+        "hires_export": False, "proxy_url": "", "cached_lyrics": "" 
     }
 
 def save_settings(settings):
@@ -74,22 +141,47 @@ def save_settings(settings):
     except:
         pass
 
+def resource_path(relative_path):
+    try:
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
+
 class StdoutRedirector:
     def __init__(self, queue_obj):
         self.queue = queue_obj
-        
     def write(self, string):
         self.queue.put(string)
-        
     def flush(self): pass
 
 class UtaSyncApp(ctk.CTk):
     def __init__(self):
         super().__init__()
+        
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                myappid = 'utasync.professional.studio.v3'
+                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
+            except Exception:
+                pass
+                
         self.title("UtaSync - Professional Subtitle Studio")
         self.geometry("1300x940") 
         self.minsize(1100, 800)
         self.configure(fg_color=BG_WORKSPACE)
+        
+        try:
+            icon_file = resource_path("icon.ico")
+            if os.path.exists(icon_file):
+                self.iconbitmap(icon_file) 
+                if 'ImageTk' in globals():
+                    img = Image.open(icon_file)
+                    self._icon_photo = ImageTk.PhotoImage(img)
+                    self.wm_iconphoto(True, self._icon_photo)
+        except Exception as e:
+            print(f"图标加载失败: {e}")
         
         self.video_path = ""
         self.is_running = False
@@ -110,7 +202,10 @@ class UtaSyncApp(ctk.CTk):
         self.after(100, self.process_console_queue)
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
-        print("💡 UtaSync 核心引擎已挂载就绪。\n等待导入媒体文件...")
+        if ENGINE_READY:
+            print("💡 UtaSync 核心引擎已挂载就绪。\n等待导入媒体文件...")
+        else:
+            print("⚡ UtaSync 以极速启动器模式运行。\n⚠️ 尚未检测到本地 AI 引擎，请点击左侧底部「引擎与模型管理」配置环境。")
 
     def save_all_ui_states(self):
         self.settings = {
@@ -130,17 +225,14 @@ class UtaSyncApp(ctk.CTk):
             "jp_size_override": getattr(self, "opt_jp_size", ctk.StringVar(value="跟随预设")).get(), 
             "fade_mode": getattr(self, "opt_fade_mode", ctk.StringVar(value="智能动态呼吸 (默认/推荐)")).get(),
             "hires_export": getattr(self, "check_hires", ctk.IntVar(value=0)).get() == 1,
-            "proxy_url": self.proxy_entry.get().strip(),
+            "proxy_url": getattr(self, "proxy_entry", ctk.StringVar(value="")).get().strip(),
             "cached_lyrics": self.lyrics_textbox.get("1.0", "end-1c") 
         }
         save_settings(self.settings)
 
     def on_closing(self):
-        try:
-            self.save_all_ui_states()
-        except Exception:
-            pass
-            
+        try: self.save_all_ui_states()
+        except: pass
         sys.stdout = sys.__stdout__
         sys.stderr = sys.__stderr__
         self.destroy()
@@ -150,26 +242,197 @@ class UtaSyncApp(ctk.CTk):
         if not self.log_queue.empty():
             content = ""
             while not self.log_queue.empty():
-                try:
-                    content += self.log_queue.get_nowait()
-                except queue.Empty:
-                    break
-            
+                try: content += self.log_queue.get_nowait()
+                except queue.Empty: break
             if content:
                 self.console_textbox.configure(state="normal")
                 self.console_textbox.insert("end", content)
                 self.console_textbox.see("end") 
                 self.console_textbox.configure(state="disabled")
-                
         self.after(50, self.process_console_queue)
 
+    def open_engine_manager(self):
+        if hasattr(self, "manager_win") and self.manager_win.winfo_exists():
+            self.manager_win.focus()
+            return
+            
+        manager_win = ctk.CTkToplevel(self)
+        self.manager_win = manager_win  
+        
+        manager_win.title("UtaSync - 组件与模型下载台")
+        manager_win.geometry("750x550")
+        manager_win.minsize(750, 550)
+        manager_win.configure(fg_color=BG_WORKSPACE)
+        
+        if hasattr(self, '_icon_photo'):
+            manager_win.after(200, lambda: manager_win.wm_iconphoto(False, self._icon_photo))
+        
+        manager_win.attributes("-topmost", True)
+        manager_win.after(200, lambda: manager_win.attributes("-topmost", False))
+        
+        header_frame = ctk.CTkFrame(manager_win, fg_color="transparent")
+        header_frame.pack(fill="x", padx=30, pady=(25, 10))
+        ctk.CTkLabel(header_frame, text="UtaSync 组件与模型管理", font=ctk.CTkFont(family="Microsoft YaHei", size=20, weight="bold"), text_color=TEXT_TITLE).pack(anchor="w")
+        ctk.CTkLabel(header_frame, text="为了保持轻量化，UtaSync 采用了核心与引擎物理分离架构。您可以按需下载所需组件。", font=ctk.CTkFont(family="Microsoft YaHei", size=12), text_color=TEXT_MUTED).pack(anchor="w", pady=(5, 0))
+
+        status_color = ACCENT_GREEN if ENGINE_READY else ACCENT_WARNING
+        status_text = "已安装版本: GPU + CPU (完全体)" if ENGINE_READY else "未检测到核心运行环境，请先下载【基础算力引擎】"
+        ctk.CTkLabel(manager_win, text=status_text, font=ctk.CTkFont(family="Microsoft YaHei", size=12), text_color=status_color).pack(anchor="w", padx=30, pady=(0, 20))
+
+        list_frame = ctk.CTkFrame(manager_win, fg_color=BG_CARD, corner_radius=10)
+        list_frame.pack(fill="both", expand=True, padx=30, pady=(0, 30))
+        
+        header = ctk.CTkFrame(list_frame, fg_color="#1E1E1E", corner_radius=10)
+        header.pack(fill="x", padx=2, pady=2)
+        header.grid_columnconfigure((0,1,2,3), weight=1)
+        
+        ctk.CTkLabel(header, text="组件 / 模型名称", font=ctk.CTkFont(weight="bold")).grid(row=0, column=0, pady=10)
+        ctk.CTkLabel(header, text="大小预估", font=ctk.CTkFont(weight="bold")).grid(row=0, column=1, pady=10)
+        ctk.CTkLabel(header, text="状态", font=ctk.CTkFont(weight="bold")).grid(row=0, column=2, pady=10)
+        ctk.CTkLabel(header, text="操作", font=ctk.CTkFont(weight="bold")).grid(row=0, column=3, pady=10)
+
+        def get_comp_status(comp_name, comp_type):
+            if comp_type == "engine":
+                return "已就绪" if ENGINE_READY else "未下载"
+            
+            if "Demucs" in comp_name:
+                home_dir = os.path.expanduser('~')
+                cache_dirs = [
+                    os.path.join(home_dir, ".cache", "torch", "hub", "checkpoints"),
+                    os.path.join(home_dir, ".local", "state", "demucs"),
+                    os.path.join(os.getenv('APPDATA', ''), "demucs"),
+                    os.path.join(os.getcwd(), ".cache", "torch", "hub", "checkpoints"),
+                    os.path.join(os.getcwd(), "models"),
+                    os.path.join(os.getcwd(), "models", "demucs")
+                ]
+                for d in cache_dirs:
+                    if os.path.exists(d):
+                        if any(f.endswith(".th") or f.endswith(".pt") or f.endswith(".yaml") or "demucs" in f.lower() or "mdx" in f.lower() for f in os.listdir(d)):
+                            return "已就绪"
+                return "未下载"
+            
+            faster_dir = "models_faster"
+            if not os.path.exists(faster_dir): return "未下载"
+            folders = [f.lower() for f in os.listdir(faster_dir)]
+            if "Large-v2" in comp_name: return "已就绪" if any("large-v2" in f for f in folders) else "未下载"
+            if "Large-v3-Turbo" in comp_name: return "已就绪" if any("large-v3-turbo" in f for f in folders) else "未下载"
+            if "Base" in comp_name: return "已就绪" if any("base" in f for f in folders) else "未下载"
+            return "未下载"
+
+        components = [
+            {"name": "基础算力引擎 (PyTorch+CUDA)\n【必须安装】", "size": "约 2.5 GB", "status": get_comp_status("基础算力引擎", "engine"), "type": "engine"},
+            {"name": "Demucs 伴奏分离模型\n(Live提取必备)", "size": "158 MB", "status": get_comp_status("Demucs", "model"), "type": "model"},
+            {"name": "Whisper Large-v2 模型\n(战神级打轴精度)", "size": "2.9 GB", "status": get_comp_status("Large-v2", "model"), "type": "model"},
+            {"name": "Whisper Large-v3-Turbo\n(极速高精度)", "size": "1.6 GB", "status": get_comp_status("Large-v3-Turbo", "model"), "type": "model"},
+            {"name": "Whisper Base 模型\n(测试专用)", "size": "145 MB", "status": get_comp_status("Base", "model"), "type": "model"},
+        ]
+
+        def execute_download_strategy(btn, status_lbl, comp):
+            if not ENGINE_READY and comp["type"] == "model":
+                messagebox.showwarning("警告", "必须先安装并解压【基础算力引擎】才能配置附属模型！", parent=manager_win)
+                return
+
+            if comp["type"] == "engine":
+                # 🌟 文案深度优化：解决“两个启动器”的认知冲突
+                response = messagebox.askquestion(
+                    "获取完全体引擎", 
+                    f"您即将下载【UtaSync 满血版一键安装包】({comp['size']})。\n\n"
+                    "💡 【分发逻辑说明】\n"
+                    "1. 当前您运行的是 50MB 的「轻量引导器」。\n"
+                    "2. 接下来会跳转浏览器下载 1.39GB 的「自解压满血包」。\n"
+                    "3. 下载并运行满血包后，您将获得一个「包含 5GB 运行环境的完整版」。\n\n"
+                    "✅ 以后您可以直接使用满血版，并删除当前这个轻量引导器。确定前往下载吗？",
+                    parent=manager_win
+                )
+            else:
+                response = messagebox.askquestion(
+                    "获取组件", 
+                    f"【{comp['name']}】体积较大 ({comp['size']})。\n\n"
+                    "点击 [是/Yes] 立即前往浏览器高速下载。\n\n"
+                    "⚠️ 【傻瓜式安装指引】\n"
+                    "1. 系统将自动为您弹开「本软件所在的本地文件夹」。\n"
+                    "2. 下载完成后，请将压缩包内解压出来的文件夹，直接拖入刚刚为您打开的文件夹中。\n"
+                    "3. 系统雷达会自动检测，一旦放入正确，界面立刻亮起绿灯！",
+                    parent=manager_win
+                )
+            
+            if response == 'yes':
+                btn.configure(text="等待放入...", fg_color="#333", text_color="#888", state="disabled")
+                print(f"🌐 正在为您打开【{comp['name']}】的官方网盘链接...")
+                # TODO: 如果你想打包极速版，记得替换下面这个链接为你最终分享的满血包网盘地址
+                webbrowser.open("https://pan.quark.cn/s/xxxxxxxx") 
+                
+                try:
+                    if sys.platform == "win32":
+                        os.startfile(os.getcwd())
+                    elif sys.platform == "darwin":
+                        subprocess.Popen(["open", os.getcwd()])
+                    else:
+                        subprocess.Popen(["xdg-open", os.getcwd()])
+                    print(f"📂 已为您自动打开放置目录: {os.getcwd()}")
+                except Exception as e:
+                    pass
+
+        ui_refs = []
+
+        for i, comp in enumerate(components):
+            row_frame = ctk.CTkFrame(list_frame, fg_color="transparent")
+            row_frame.pack(fill="x", pady=2)
+            row_frame.grid_columnconfigure((0,1,2,3), weight=1)
+            
+            if i > 0:
+                ctk.CTkFrame(list_frame, height=1, fg_color="#252525").pack(fill="x", padx=15)
+            
+            ctk.CTkLabel(row_frame, text=comp["name"], justify="center", font=ctk.CTkFont(size=12)).grid(row=0, column=0, pady=12)
+            ctk.CTkLabel(row_frame, text=comp["size"], font=ctk.CTkFont(size=12)).grid(row=0, column=1, pady=12)
+            
+            is_ready = comp["status"] == "已就绪"
+            status_lbl = ctk.CTkLabel(row_frame, text=comp["status"], text_color=ACCENT_GREEN if is_ready else TEXT_MUTED, font=ctk.CTkFont(size=12))
+            status_lbl.grid(row=0, column=2, pady=12)
+            
+            if is_ready:
+                btn = ctk.CTkButton(row_frame, text="✅ 已完成", width=80, height=28, fg_color="transparent", text_color=TEXT_MUTED, state="disabled")
+            else:
+                btn = ctk.CTkButton(row_frame, text="⬇️ 获取组件", width=80, height=28, fg_color="#1E3A8A", hover_color="#0284C7", font=ctk.CTkFont(size=12, weight="bold"))
+                btn.configure(command=lambda b=btn, s=status_lbl, c=comp: execute_download_strategy(b, s, c))
+            btn.grid(row=0, column=3, pady=12)
+            
+            ui_refs.append({"comp": comp, "status_lbl": status_lbl, "btn": btn})
+
+        def auto_scan_radar():
+            if not manager_win.winfo_exists():
+                return 
+                
+            for ref in ui_refs:
+                c = ref["comp"]
+                latest_status = get_comp_status(c["name"], c["type"])
+                
+                if latest_status == "已就绪" and ref["status_lbl"].cget("text") != "已就绪":
+                    ref["status_lbl"].configure(text="已就绪", text_color=ACCENT_GREEN)
+                    ref["btn"].configure(text="✅ 已完成", state="disabled", fg_color="transparent", text_color=TEXT_MUTED)
+                    print(f"🎉 [系统雷达] 侦测到组件【{c['name'].split()[0]}】已解压就绪！")
+            
+            manager_win.after(2000, auto_scan_radar)
+
+        auto_scan_radar()
+
     def show_help_dialog(self):
+        if hasattr(self, "help_window") and self.help_window.winfo_exists():
+            self.help_window.focus()
+            return
+            
         help_window = ctk.CTkToplevel(self)
+        self.help_window = help_window
         help_window.title("UtaSync 参数说明与帮助指南")
         help_window.geometry("680x850")
         help_window.minsize(600, 650)
         help_window.configure(fg_color=BG_WORKSPACE)
+        
+        if hasattr(self, '_icon_photo'):
+            help_window.after(200, lambda: help_window.wm_iconphoto(False, self._icon_photo))
+            
         help_window.attributes("-topmost", True) 
+        help_window.after(200, lambda: help_window.attributes("-topmost", False))
         
         title_lbl = ctk.CTkLabel(help_window, text="📖 UtaSync 参数配置说明", font=ctk.CTkFont(family="Microsoft YaHei", size=18, weight="bold"), text_color=TEXT_TITLE)
         title_lbl.pack(pady=(25, 15))
@@ -210,7 +473,8 @@ class UtaSyncApp(ctk.CTk):
         self.logo_label = ctk.CTkLabel(self.sidebar, text="UtaSync", font=ctk.CTkFont(family="Segoe UI Black", size=42, weight="bold"), text_color=TEXT_TITLE)
         self.logo_label.grid(row=0, column=0, padx=40, pady=(45, 0), sticky="w")
         
-        self.subtitle_label = ctk.CTkLabel(self.sidebar, text="Auto Subtitle Pipeline", font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"), text_color=TEXT_MUTED)
+        mode_text = "Auto Subtitle Pipeline" if ENGINE_READY else "Lightweight Launcher"
+        self.subtitle_label = ctk.CTkLabel(self.sidebar, text=mode_text, font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"), text_color=ACCENT_GREEN if ENGINE_READY else TEXT_MUTED)
         self.subtitle_label.grid(row=1, column=0, padx=42, pady=(0, 15), sticky="w")
 
         self.help_btn = ctk.CTkButton(self.sidebar, text="📖 参数指南说明", font=ctk.CTkFont(family="Microsoft YaHei", size=11, weight="bold"), width=110, height=26, fg_color="#181818", hover_color="#2A2A2A", text_color=TEXT_MUTED, corner_radius=6, command=self.show_help_dialog)
@@ -234,24 +498,28 @@ class UtaSyncApp(ctk.CTk):
         self._add_group_label(self.settings_group, "声学模型 (Acoustic)", row_idx); row_idx += 1
         self.opt_audio_type = ctk.CTkOptionMenu(self.settings_group, font=ctk.CTkFont(family="Microsoft YaHei", size=13), values=["Live 现场演唱 (常规/摇滚)", "Live 现场演唱 (极柔气声/清唱)", "访谈 / 电台播客"], fg_color="#222222", text_color=TEXT_TITLE, button_color="#222222", button_hover_color="#2A2A2A")
         self.opt_audio_type.set(self.settings.get("audio_type", "Live 现场演唱 (常规/摇滚)"))
+        if not ENGINE_READY: self.opt_audio_type.configure(state="disabled")
         self.opt_audio_type.grid(row=row_idx, column=0, padx=15, pady=(0, 10), sticky="ew"); row_idx += 1
         self._add_group_divider(self.settings_group, row_idx); row_idx += 1
 
         self._add_group_label(self.settings_group, "算力调度 (Hardware)", row_idx); row_idx += 1
         self.opt_hardware = ctk.CTkOptionMenu(self.settings_group, font=ctk.CTkFont(family="Microsoft YaHei", size=13), values=["极限防爆 (4G~6G显存/默认)", "均衡提速 (8G显存)", "满血狂飙 (12G+显存)"], fg_color="#222222", text_color=TEXT_TITLE, button_color="#222222", button_hover_color="#2A2A2A")
         self.opt_hardware.set(self.settings.get("hardware_mode", "极限防爆 (4G~6G显存/默认)"))
+        if not ENGINE_READY: self.opt_hardware.configure(state="disabled")
         self.opt_hardware.grid(row=row_idx, column=0, padx=15, pady=(0, 10), sticky="ew"); row_idx += 1
         self._add_group_divider(self.settings_group, row_idx); row_idx += 1
 
         self._add_group_label(self.settings_group, "分离策略 (Demucs)", row_idx); row_idx += 1
         self.opt_demucs = ctk.CTkOptionMenu(self.settings_group, font=ctk.CTkFont(family="Microsoft YaHei", size=13), values=["开启分离 (Live音乐必选)", "强制跳过 (极速/仅限无伴奏访谈)"], fg_color="#222222", text_color=TEXT_TITLE, button_color="#222222", button_hover_color="#2A2A2A")
         self.opt_demucs.set(self.settings.get("use_demucs", "开启分离 (Live音乐必选)"))
+        if not ENGINE_READY: self.opt_demucs.configure(state="disabled")
         self.opt_demucs.grid(row=row_idx, column=0, padx=15, pady=(0, 10), sticky="ew"); row_idx += 1
         self._add_group_divider(self.settings_group, row_idx); row_idx += 1
 
         self._add_group_label(self.settings_group, "引擎精度 (Whisper)", row_idx); row_idx += 1
         self.opt_model = ctk.CTkOptionMenu(self.settings_group, font=ctk.CTkFont(family="Microsoft YaHei", size=13), values=["large-v2 (战神级/推荐)", "large-v3-turbo (极速高精)", "large-v3", "medium (省显存)", "small", "base"], fg_color="#222222", text_color=TEXT_TITLE, button_color="#222222", button_hover_color="#2A2A2A")
         self.opt_model.set(self.settings.get("model_size", "large-v2 (战神级/推荐)"))
+        if not ENGINE_READY: self.opt_model.configure(state="disabled")
         self.opt_model.grid(row=row_idx, column=0, padx=15, pady=(0, 10), sticky="ew"); row_idx += 1
         self._add_group_divider(self.settings_group, row_idx); row_idx += 1
 
@@ -381,11 +649,23 @@ class UtaSyncApp(ctk.CTk):
         self.opt_output_mode.set(self.settings.get("output_mode", "中日双语字幕"))
         self.opt_output_mode.grid(row=row_idx, column=0, padx=15, pady=(0, 15), sticky="ew"); row_idx += 1
 
-        self.run_btn = ctk.CTkButton(self.sidebar, text="启动处理引擎", font=ctk.CTkFont(family="Microsoft YaHei", size=16, weight="bold"), height=55, corner_radius=27, text_color="#000000", fg_color=ACCENT_GREEN, hover_color="#1ED760", command=self.toggle_process)
-        self.run_btn.grid(row=6, column=0, padx=40, pady=(5, 10), sticky="ew")
+        if ENGINE_READY:
+            btn_text = "启动处理引擎"
+            btn_color = ACCENT_GREEN
+            text_color = "#000000"
+        else:
+            btn_text = "启动处理引擎" 
+            btn_color = ACCENT_GREEN
+            text_color = "#000000"
+
+        self.run_btn = ctk.CTkButton(self.sidebar, text=btn_text, font=ctk.CTkFont(family="Microsoft YaHei", size=15, weight="bold"), height=55, corner_radius=27, text_color=text_color, fg_color=btn_color, hover_color="#1ED760", command=self.toggle_process)
+        self.run_btn.grid(row=6, column=0, padx=40, pady=(5, 5), sticky="ew")
+        
+        self.mgr_btn = ctk.CTkButton(self.sidebar, text="⚙️ 引擎与模型管理", font=ctk.CTkFont(family="Microsoft YaHei", size=11, weight="bold"), height=30, fg_color="transparent", hover_color="#1E1E1E", text_color=TEXT_MUTED, command=self.open_engine_manager)
+        self.mgr_btn.grid(row=7, column=0, pady=(0, 10))
 
         self.progressbar = ctk.CTkProgressBar(self.sidebar, mode="determinate", height=4, fg_color="#252525", progress_color=ACCENT_GREEN, corner_radius=2)
-        self.progressbar.grid(row=7, column=0, padx=60, pady=(0, 25), sticky="ew")
+        self.progressbar.grid(row=8, column=0, padx=60, pady=(0, 25), sticky="ew")
         self.progressbar.set(0) 
 
     def on_api_preset_change(self, choice):
@@ -469,11 +749,8 @@ class UtaSyncApp(ctk.CTk):
         base_config = ASS_PRESETS.get(ass_choice, ASS_PRESETS.get("默认双语 (纯白+浅灰)"))
         config = copy.deepcopy(base_config)
         
-        if self.opt_ch_font.get() != "跟随预设":
-            config["ch_font"] = self.opt_ch_font.get()
-        if self.opt_jp_font.get() != "跟随预设":
-            config["jp_font"] = self.opt_jp_font.get()
-            
+        if self.opt_ch_font.get() != "跟随预设": config["ch_font"] = self.opt_ch_font.get()
+        if self.opt_jp_font.get() != "跟随预设": config["jp_font"] = self.opt_jp_font.get()
         if self.opt_ch_size.get() != "跟随预设":
             try: config["ch_size"] = int(self.opt_ch_size.get())
             except: pass
@@ -490,70 +767,14 @@ class UtaSyncApp(ctk.CTk):
             <meta charset="UTF-8">
             <title>{ass_choice} - 样式预览</title>
             <style>
-                body {{
-                    background-color: #121212;
-                    display: flex;
-                    flex-direction: column;
-                    justify-content: center;
-                    align-items: center;
-                    height: 100vh;
-                    margin: 0;
-                    color: white;
-                    font-family: sans-serif;
-                }}
-                .stage {{
-                    width: 800px;
-                    height: 450px;
-                    background: linear-gradient(135deg, #1f1c2c 0%, #928dab 100%);
-                    border-radius: 12px;
-                    display: flex;
-                    flex-direction: column;
-                    justify-content: flex-end;
-                    padding-bottom: 40px;
-                    align-items: center;
-                    box-shadow: 0 20px 50px rgba(0,0,0,0.5);
-                    position: relative;
-                    overflow: hidden;
-                }}
-                .stage::after {{
-                    content: "";
-                    position: absolute;
-                    top: 0; left: 0; right: 0; bottom: 0;
-                    background: radial-gradient(circle at 50% 0%, rgba(255,255,255,0.05), transparent 60%);
-                }}
-                .subtitle-container {{
-                    text-align: center;
-                    animation: fadeEffect 4s ease-in-out infinite;
-                }}
-                @keyframes fadeEffect {{
-                    0% {{ opacity: 0; }}
-                    15% {{ opacity: 1; }}
-                    85% {{ opacity: 1; }}
-                    100% {{ opacity: 0; }}
-                }}
-                .ch-text {{
-                    font-family: "{config.get('ch_font', 'Microsoft YaHei')}", sans-serif;
-                    font-size: {config.get('ch_size', 55)}px;
-                    color: {config.get('ch_color', '#FFFFFF')};
-                    -webkit-text-stroke: {config.get('outline_size', 3)}px {config.get('outline_color', '#000000')};
-                    text-shadow: {config.get('shadow_size', 2)}px {config.get('shadow_size', 2)}px 0px {config.get('outline_color', '#000000')};
-                    font-weight: bold;
-                    margin-bottom: 10px;
-                    z-index: 10;
-                }}
-                .jp-text {{
-                    font-family: "{config.get('jp_font', 'Meiryo')}", sans-serif;
-                    font-size: {config.get('jp_size', 35)}px;
-                    color: {config.get('jp_color', '#CCCCCC')};
-                    -webkit-text-stroke: {config.get('outline_size', 3)}px {config.get('outline_color', '#000000')};
-                    text-shadow: {config.get('shadow_size', 2)}px {config.get('shadow_size', 2)}px 0px {config.get('outline_color', '#000000')};
-                    font-weight: normal;
-                    z-index: 10;
-                }}
-                .info {{
-                    margin-top: 30px;
-                    color: #888;
-                }}
+                body {{ background-color: #121212; display: flex; flex-direction: column; justify-content: center; align-items: center; height: 100vh; margin: 0; color: white; font-family: sans-serif; }}
+                .stage {{ width: 800px; height: 450px; background: linear-gradient(135deg, #1f1c2c 0%, #928dab 100%); border-radius: 12px; display: flex; flex-direction: column; justify-content: flex-end; padding-bottom: 40px; align-items: center; box-shadow: 0 20px 50px rgba(0,0,0,0.5); position: relative; overflow: hidden; }}
+                .stage::after {{ content: ""; position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: radial-gradient(circle at 50% 0%, rgba(255,255,255,0.05), transparent 60%); }}
+                .subtitle-container {{ text-align: center; animation: fadeEffect 4s ease-in-out infinite; }}
+                @keyframes fadeEffect {{ 0% {{ opacity: 0; }} 15% {{ opacity: 1; }} 85% {{ opacity: 1; }} 100% {{ opacity: 0; }} }}
+                .ch-text {{ font-family: "{config.get('ch_font', 'Microsoft YaHei')}", sans-serif; font-size: {config.get('ch_size', 55)}px; color: {config.get('ch_color', '#FFFFFF')}; -webkit-text-stroke: {config.get('outline_size', 3)}px {config.get('outline_color', '#000000')}; text-shadow: {config.get('shadow_size', 2)}px {config.get('shadow_size', 2)}px 0px {config.get('outline_color', '#000000')}; font-weight: bold; margin-bottom: 10px; z-index: 10; }}
+                .jp-text {{ font-family: "{config.get('jp_font', 'Meiryo')}", sans-serif; font-size: {config.get('jp_size', 35)}px; color: {config.get('jp_color', '#CCCCCC')}; -webkit-text-stroke: {config.get('outline_size', 3)}px {config.get('outline_color', '#000000')}; text-shadow: {config.get('shadow_size', 2)}px {config.get('shadow_size', 2)}px 0px {config.get('outline_color', '#000000')}; font-weight: normal; z-index: 10; }}
+                .info {{ margin-top: 30px; color: #888; }}
             </style>
         </head>
         <body>
@@ -576,6 +797,9 @@ class UtaSyncApp(ctk.CTk):
             messagebox.showerror("错误", f"预览生成失败: {e}")
 
     def quick_redraw_ass(self):
+        if not ENGINE_READY:
+            self.open_engine_manager()
+            return
         if not self.video_path:
             messagebox.showwarning("提示", "请先在左侧导入您刚才处理过的媒体文件！")
             return
@@ -603,11 +827,8 @@ class UtaSyncApp(ctk.CTk):
             base_config = ASS_PRESETS.get(ass_choice, ASS_PRESETS.get("默认双语 (纯白+浅灰)"))
             config = copy.deepcopy(base_config)
             
-            if self.opt_ch_font.get() != "跟随预设":
-                config["ch_font"] = self.opt_ch_font.get()
-            if self.opt_jp_font.get() != "跟随预设":
-                config["jp_font"] = self.opt_jp_font.get()
-                
+            if self.opt_ch_font.get() != "跟随预设": config["ch_font"] = self.opt_ch_font.get()
+            if self.opt_jp_font.get() != "跟随预设": config["jp_font"] = self.opt_jp_font.get()
             if self.opt_ch_size.get() != "跟随预设":
                 try: config["ch_size"] = int(self.opt_ch_size.get())
                 except: pass
@@ -628,7 +849,6 @@ class UtaSyncApp(ctk.CTk):
         if self.is_running:
             messagebox.showwarning("提示", "当前有任务正在运行，请稍后再试！")
             return
-            
         if not self.video_path:
             messagebox.showwarning("提示", "请先在左侧导入原视频文件！")
             return
@@ -675,15 +895,14 @@ class UtaSyncApp(ctk.CTk):
                 print("   -> 🎧 [Hi-Res 模式已开启] 强制封装为 MKV + 32-bit FLAC 无损音频！")
             else:
                 final_video = os.path.join(output_dir, f"{base_name}_成品带字版.mp4")
-                audio_args = ["-c:a", "copy"]
+                audio_args = ["-c:a", "aac", "-b:a", "320k"]
             
             temp_ass_name = "temp_burn_subtitles.ass"
             temp_ass_path = os.path.join(output_dir, temp_ass_name)
             shutil.copy(target_ass, temp_ass_path)
             
-            # 🌟 全平台硬件加速策略 (智能级联回退)
             hardware_encoders = [
-                {"name": "NVIDIA 显卡 (NVENC)", "vcodec": "h264_nvenc", "args": ["-preset", "p4", "-cq", "22"]},
+                {"name": "NVIDIA 显卡 (NVENC)", "vcodec": "h264_nvenc", "args": ["-preset", "fast", "-pix_fmt", "yuv420p", "-cq", "22"]},
                 {"name": "Apple Mac (VideoToolbox)", "vcodec": "h264_videotoolbox", "args": ["-q:v", "50"]},
                 {"name": "Intel 核显 (QSV)", "vcodec": "h264_qsv", "args": ["-preset", "fast", "-global_quality", "22"]},
                 {"name": "AMD 显卡 (AMF)", "vcodec": "h264_amf", "args": ["-quality", "speed", "-rc", "vbr", "-qp_i", "22"]},
@@ -693,31 +912,21 @@ class UtaSyncApp(ctk.CTk):
             start_time = time.time()
             success = False
             
-            # 🌟 核心升级：系统级智能调度 (Background Priority)
-            # 告诉系统这是一个后台任务，如果用户开游戏，自动让出 CPU/GPU 资源
             popen_kwargs = {
-                "cwd": output_dir,
-                "stdout": subprocess.DEVNULL,
-                "stderr": subprocess.PIPE,
-                "text": True,
-                "encoding": "utf-8",
-                "errors": "ignore"
+                "cwd": output_dir, "stdout": subprocess.DEVNULL, "stderr": subprocess.PIPE,
+                "text": True, "encoding": "utf-8", "errors": "ignore"
             }
-            # 如果是 Windows 系统，设置底层进程优先级为“低于正常 (BELOW_NORMAL)”
-            if sys.platform == "win32":
-                popen_kwargs["creationflags"] = subprocess.BELOW_NORMAL_PRIORITY_CLASS
+            if sys.platform == "win32": popen_kwargs["creationflags"] = subprocess.BELOW_NORMAL_PRIORITY_CLASS
             
             for enc in hardware_encoders:
                 print(f"   -> 🚀 [智能调度] 尝试使用 {enc['name']} 引擎压制...")
                 cmd = [
                     "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", self.video_path,
-                    "-vf", f"subtitles={temp_ass_name}",
+                    "-vf", f"scale=trunc(iw/2)*2:trunc(ih/2)*2,subtitles={temp_ass_name}",
                     "-c:v", enc["vcodec"]
                 ] + enc["args"] + audio_args + [final_video]
 
-                # 携带低优先级调度指令启动 FFmpeg
                 process = subprocess.Popen(cmd, **popen_kwargs)
-                
                 last_heartbeat = time.time()
                 
                 while process.poll() is None:
@@ -725,9 +934,7 @@ class UtaSyncApp(ctk.CTk):
                         process.kill()
                         process.wait()
                         raise Exception("用户手动终止了压制任务")
-                    
                     time.sleep(0.5) 
-                    
                     current_time = time.time()
                     if current_time - last_heartbeat >= 10:
                         elapsed = int(current_time - start_time)
@@ -742,7 +949,12 @@ class UtaSyncApp(ctk.CTk):
                     _, stderr_data = process.communicate()
                     if "Cancel" in stderr_data or self.cancel_event.is_set():
                         raise Exception("用户手动终止了压制任务")
-                    print(f"   -> ⚠️ {enc['name']} 不受支持或初始化失败。准备降级...")
+                    error_reason = "未知错误"
+                    if stderr_data:
+                        lines = [line for line in stderr_data.split('\n') if line.strip()]
+                        if lines: error_reason = " | ".join(lines[-3:])
+                    print(f"   -> ⚠️ {enc['name']} 初始化失败。底层截获报错: {error_reason}")
+                    print("   -> 🔄 准备降级...")
             
             if not success:
                 raise Exception("所有硬件加速及 CPU 软压均失败，请检查 FFmpeg 环境。")
@@ -751,9 +963,7 @@ class UtaSyncApp(ctk.CTk):
             print(f"\n🎉 压制大功告成！(总耗时: {elapsed_total} 秒)")
             print(f"📁 您的【最终成品视频】已安全保存在:\n{final_video}")
                 
-            if os.path.exists(temp_ass_path):
-                os.remove(temp_ass_path)
-                
+            if os.path.exists(temp_ass_path): os.remove(temp_ass_path)
             self.after(0, self.update_ui_status, 1.0, "🎉 压 制 完 成 ！")
             self.after(0, lambda: self.run_btn.configure(fg_color=ACCENT_GREEN, hover_color="#1ED760"))
             
@@ -770,16 +980,15 @@ class UtaSyncApp(ctk.CTk):
             self.after(0, lambda: self.progressbar.set(0.0))
 
     def toggle_process(self):
+        if not ENGINE_READY:
+            self.open_engine_manager()
+            return
         if self.is_running:
-            response = messagebox.askyesno(
-                "终止任务", 
-                "⚠️ 确定要终止当前任务吗？\n\n系统已升级【深层安全中断】机制，将立即切断底层的 AI 运算和显存占用，不再需要漫长等待！"
-            )
+            response = messagebox.askyesno("终止任务", "⚠️ 确定要终止当前任务吗？\n\n系统已升级【深层安全中断】机制，将立即切断底层的 AI 运算和显存占用，不再需要漫长等待！")
             if response:
                 self.cancel_event.set()
                 self.run_btn.configure(text="🛑 正在强制切断底层进程...", state="disabled", fg_color="#222222", text_color="#888888")
             return
-
         if not self.video_path:
             messagebox.showwarning("警告", "请先在左侧导入媒体文件！")
             return
@@ -808,44 +1017,28 @@ class UtaSyncApp(ctk.CTk):
         if os.path.exists(expected_srt):
             saved_asr_hash = ""
             if os.path.exists(asr_hash_file_path):
-                with open(asr_hash_file_path, "r", encoding="utf-8") as f:
-                    saved_asr_hash = f.read().strip()
-            
+                with open(asr_hash_file_path, "r", encoding="utf-8") as f: saved_asr_hash = f.read().strip()
             if current_asr_hash != saved_asr_hash:
-                messagebox.showinfo(
-                    "🎙️ 引擎参数已变更", 
-                    "侦测到您修改了【声学模型】或【分离策略/引擎精度】！\n\n系统将废弃旧的原文字幕，使用新参数重新提取打轴。\n\n💡 提示：若您仅修改了模型或精度，系统会自动复用之前分离好的人声文件，为您节省大量时间！"
-                )
+                messagebox.showinfo("🎙️ 引擎参数已变更", "侦测到您修改了【声学模型】或【分离策略/引擎精度】！\n\n系统将废弃旧的原文字幕，使用新参数重新提取打轴。\n\n💡 提示：若您仅修改了模型或精度，系统会自动复用之前分离好的人声文件，为您节省大量时间！")
                 print("\n🎙️ [智能管家] 侦测到打轴参数更改，准备重新生成原文字幕。")
                 skip_generator = False
             else:
-                response = messagebox.askyesno(
-                    "安全断点续传 (阶段一)", 
-                    f"发现已存在的原文字幕：\n{base_name}_极致打轴.srt\n\n您的打轴参数未发生改变，是否跳过漫长的人声分离与听写阶段，直接读取该文件进行大模型翻译？\n\n(选 '是' 极速直达翻译，选 '否' 将覆写并重新运行)"
-                )
+                response = messagebox.askyesno("安全断点续传 (阶段一)", f"发现已存在的原文字幕：\n{base_name}_极致打轴.srt\n\n您的打轴参数未发生改变，是否跳过漫长的人声分离与听写阶段，直接读取该文件进行大模型翻译？\n\n(选 '是' 极速直达翻译，选 '否' 将覆写并重新运行)")
                 if response: skip_generator = True
 
         if os.path.exists(trans_cache_file_path):
             saved_trans_hash = ""
             if os.path.exists(trans_hash_file_path):
-                with open(trans_hash_file_path, "r", encoding="utf-8") as f:
-                    saved_trans_hash = f.read().strip()
-            
+                with open(trans_hash_file_path, "r", encoding="utf-8") as f: saved_trans_hash = f.read().strip()
             if not skip_generator:
                 print("   -> ⚠️ 侦测到原文字幕即将重新生成，旧翻译缓存已自动作废。")
                 clear_cache = True
             elif current_trans_hash != saved_trans_hash:
-                messagebox.showinfo(
-                    "🧠 翻译配置已变更", 
-                    "侦测到您修改了【参考歌词】或【接口/排版配置】！\n\n为防止采用旧缓存导致前后翻译格式错乱，系统已自动为您隔离了旧数据。\n\n本次将采用您的新配置进行全新翻译！"
-                )
+                messagebox.showinfo("🧠 翻译配置已变更", "侦测到您修改了【参考歌词】或【接口/排版配置】！\n\n为防止采用旧缓存导致前后翻译格式错乱，系统已自动为您隔离了旧数据。\n\n本次将采用您的新配置进行全新翻译！")
                 print("\n🧠 [智能管家] 侦测到配置更改，旧翻译缓存已安全废弃，准备全新翻译。")
                 clear_cache = True
             else:
-                response = messagebox.askyesno(
-                    "安全断点续传 (阶段二)", 
-                    "检测到未完成的翻译缓存，且您的歌词与设置均未改变。\n\n是否继续上一次的翻译进度？\n\n(选 '是' 安全续传，选 '否' 清除重翻)"
-                )
+                response = messagebox.askyesno("安全断点续传 (阶段二)", "检测到未完成的翻译缓存，且您的歌词与设置均未改变。\n\n是否继续上一次的翻译进度？\n\n(选 '是' 安全续传，选 '否' 清除重翻)")
                 if not response: clear_cache = True
 
         self.is_running = True
@@ -859,26 +1052,13 @@ class UtaSyncApp(ctk.CTk):
             self.after(0, self.update_ui_status, 0.05, "⏹ 取消任务 (引擎预热...)")
             
             audio_type_raw = self.opt_audio_type.get()
-            if "访谈" in audio_type_raw:
-                audio_type = "speech"
-            elif "极柔气声" in audio_type_raw:
-                audio_type = "live_soft"
-            else:
-                audio_type = "live"
-                
+            audio_type = "speech" if "访谈" in audio_type_raw else ("live_soft" if "极柔气声" in audio_type_raw else "live")
             model_size = self.opt_model.get().split(" ")[0]
-            
             hw_mode_raw = self.opt_hardware.get()
-            if "均衡" in hw_mode_raw:
-                hw_mode = "medium"
-            elif "满血" in hw_mode_raw:
-                hw_mode = "high"
-            else:
-                hw_mode = "low"
+            hw_mode = "medium" if "均衡" in hw_mode_raw else ("high" if "满血" in hw_mode_raw else "low")
             
             base_url = self.api_url_entry.get().strip()
             p_model = self.api_model_entry.get().strip()
-            
             api_key = self.api_key_entry.get().strip()
             proxy_url = self.proxy_entry.get().strip() 
             output_mode = "chinese_only" if "纯中文" in self.opt_output_mode.get() else "bilingual"
@@ -904,62 +1084,43 @@ class UtaSyncApp(ctk.CTk):
                 self.after(0, self.update_ui_status, 0.5, "⏹ 取消任务 (直达翻译...)")
                 print(f"\n⏩ [断点续传] 用户选择跳过音频处理，直接使用本地字幕: {expected_srt}")
                 srt_path = expected_srt
-                with open(asr_hash_file_path, "w", encoding="utf-8") as f:
-                    f.write(current_asr_hash)
+                with open(asr_hash_file_path, "w", encoding="utf-8") as f: f.write(current_asr_hash)
             else:
                 self.after(0, self.update_ui_status, 0.1, "⏹ 取消任务 (打轴中...)")
                 generator = LiveSubtitleGenerator(video_path=self.video_path)
                 srt_path = generator.run(model_size=model_size, audio_type=audio_type, skip_separation=skip_sep, hardware_mode=hw_mode, cancel_event=self.cancel_event)
                 if not srt_path: raise Exception("打轴阶段未能返回有效的 SRT 路径。")
-                
-                with open(asr_hash_file_path, "w", encoding="utf-8") as f:
-                    f.write(current_asr_hash)
+                with open(asr_hash_file_path, "w", encoding="utf-8") as f: f.write(current_asr_hash)
 
             if self.cancel_event.is_set(): raise Exception("用户手动终止了任务")
 
             if clear_cache:
                 cache_file_path = os.path.join(output_dir, "subtitles", f"{base_name}_极致打轴_翻译缓存.json")
-                if os.path.exists(cache_file_path):
-                    os.remove(cache_file_path)
-                if os.path.exists(trans_hash_file_path):
-                    os.remove(trans_hash_file_path)
+                if os.path.exists(cache_file_path): os.remove(cache_file_path)
+                if os.path.exists(trans_hash_file_path): os.remove(trans_hash_file_path)
                 print("   -> 🗑️ 旧缓存及指纹已清除，准备全新翻译。")
 
             final_srt = None
             if api_key:
                 self.after(0, self.update_ui_status, 0.6, "⏹ 取消任务 (AI翻译中...)")
-                
                 print(f"\n🌍 [大模型矩阵启动] 开始执行听译与纠错排版...")
-                
                 r_model = p_model 
-                if "gemini-2.5-flash" in p_model:
-                    r_model = "gemini-2.5-pro"
-                elif "DeepSeek-V3" in p_model:
-                    r_model = "deepseek-ai/DeepSeek-R1"
+                if "gemini-2.5-flash" in p_model: r_model = "gemini-2.5-pro"
+                elif "DeepSeek-V3" in p_model: r_model = "deepseek-ai/DeepSeek-R1"
 
                 temp_lyrics_path = os.path.join(output_dir, "temp_lyrics_gui.txt")
-                with open(temp_lyrics_path, "w", encoding="utf-8") as f: 
-                    f.write(lyrics_text)
+                with open(temp_lyrics_path, "w", encoding="utf-8") as f: f.write(lyrics_text)
 
                 translator = SubtitleTranslator(
-                    api_key=api_key, 
-                    base_url=base_url, 
-                    primary_model=p_model, 
-                    reasoning_model=r_model,
-                    srt_path=srt_path, 
-                    reference_txt_path=temp_lyrics_path, 
-                    output_mode=output_mode,
-                    proxy_url=proxy_url 
+                    api_key=api_key, base_url=base_url, primary_model=p_model, reasoning_model=r_model,
+                    srt_path=srt_path, reference_txt_path=temp_lyrics_path, output_mode=output_mode, proxy_url=proxy_url 
                 )
                 final_srt = translator.run(cancel_event=self.cancel_event)
-                
-                if os.path.exists(temp_lyrics_path): 
-                    os.remove(temp_lyrics_path) 
+                if os.path.exists(temp_lyrics_path): os.remove(temp_lyrics_path) 
                 
                 if final_srt: 
                     print(f"\n🎉 最终字幕位置: {final_srt}")
-                    with open(trans_hash_file_path, "w", encoding="utf-8") as f:
-                        f.write(current_trans_hash)
+                    with open(trans_hash_file_path, "w", encoding="utf-8") as f: f.write(current_trans_hash)
             else:
                 self.after(0, self.update_ui_status, 0.6, "⚠️ 未检测到 Key, 翻译跳过...")
                 print("\n⚠️ 未检测到 API Key，跳过大模型翻译。")
@@ -974,25 +1135,18 @@ class UtaSyncApp(ctk.CTk):
                     try:
                         base_config = ASS_PRESETS.get(ass_choice, ASS_PRESETS.get("默认双语 (纯白+浅灰)"))
                         config = copy.deepcopy(base_config)
-                        
                         ch_override = getattr(self, "opt_ch_font", ctk.StringVar(value="跟随预设")).get()
-                        if ch_override != "跟随预设":
-                            config["ch_font"] = ch_override
-                            
+                        if ch_override != "跟随预设": config["ch_font"] = ch_override
                         jp_override = getattr(self, "opt_jp_font", ctk.StringVar(value="跟随预设")).get()
-                        if jp_override != "跟随预设":
-                            config["jp_font"] = jp_override
-                            
+                        if jp_override != "跟随预设": config["jp_font"] = jp_override
                         ch_size_override = getattr(self, "opt_ch_size", ctk.StringVar(value="跟随预设")).get()
                         if ch_size_override != "跟随预设":
                             try: config["ch_size"] = int(ch_size_override)
                             except: pass
-                            
                         jp_size_override = getattr(self, "opt_jp_size", ctk.StringVar(value="跟随预设")).get()
                         if jp_size_override != "跟随预设":
                             try: config["jp_size"] = int(jp_size_override)
                             except: pass
-                            
                         config["fade_mode"] = getattr(self, "opt_fade_mode", ctk.StringVar(value="智能动态呼吸 (默认/推荐)")).get()
 
                         maker = ASSMaker(final_srt)
@@ -1015,7 +1169,6 @@ class UtaSyncApp(ctk.CTk):
         finally:
             self.is_running = False
             gc.collect()
-            
             self.after(0, lambda: self.run_btn.configure(text="启动处理引擎", state="normal", fg_color=ACCENT_GREEN, hover_color="#1ED760", text_color="#000000"))
             self.after(0, lambda: self.progressbar.set(0.0))
 
